@@ -81,8 +81,8 @@ def draw_label_page(doc, row):
     never drift out of sync with each other.
     """
     label_width = 300
-    top_margin = 44  # space reserved for ID / Test Date lines
-    row_height = 20  # vertical space per test checkbox line
+    top_margin = 48  # space reserved for ID / Test Date lines
+    row_height = 26  # vertical space per test checkbox line
     bottom_margin = 8
 
     project_tests = get_project_tests(row["Project"]) or [row["TestType"]]
@@ -96,7 +96,7 @@ def draw_label_page(doc, row):
 
     test_date_str = row["TestDate"] if pd.notna(row["TestDate"]) else ""
 
-    shape.insert_text((10, 20), f"ID: {row['SampleID']}", fontsize=15)
+    shape.insert_text((10, 15), f"ID: {row['SampleID']}", fontsize=15)
     shape.insert_text((10, 34), f"Test Date: {test_date_str}", fontsize=12)
 
     # Two-column layout for checkboxes
@@ -104,18 +104,20 @@ def draw_label_page(doc, row):
     col_width = (label_width - 20 - col_gap) / 2  # 20 = left/right margins
     col_x = [10, 10 + col_width + col_gap]
 
+    box_size = 26  # bigger checkbox
+
     for i, test in enumerate(project_tests):
         col = i % 2
         row_idx = i // 2
         x = col_x[col]
         y = top_margin + row_idx * row_height
 
-        box = fitz.Rect(x, y, x + 8, y + 8)
+        box = fitz.Rect(x, y, x + box_size, y + box_size)
         shape.draw_rect(box)
         #if test == row["TestType"]:
         #    shape.draw_line(box.top_left, box.bottom_right)
         #    shape.draw_line(box.bottom_left, box.top_right)
-        shape.insert_text((x + 12, y + 7), test, fontsize=8)
+        shape.insert_text((x + box_size + 4, y + box_size - 2), test, fontsize=11)
 
     shape.finish(width=0.5)
     shape.commit()

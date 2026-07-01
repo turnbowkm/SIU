@@ -4,6 +4,7 @@ from datetime import date
 import fitz
 import tempfile
 import os
+import math
 
 # Load configuration
 config_df = pd.read_csv("config.csv")
@@ -79,13 +80,15 @@ def draw_label_page(doc, row):
     Shared by both the download PDF and the live preview so they can
     never drift out of sync with each other.
     """
-    label_width = 216
+    label_width = 300
     top_margin = 44  # space reserved for ID / Test Date lines
-    row_height = 12  # vertical space per test checkbox line
+    row_height = 20  # vertical space per test checkbox line
     bottom_margin = 8
 
     project_tests = get_project_tests(row["Project"]) or [row["TestType"]]
-    label_height = max(72, top_margin + len(project_tests) * row_height + bottom_margin)
+    num_tests = len(project_tests)
+    rows_needed = math.ceil(num_tests / 2)  # 2 columns
+    label_height = max(72, top_margin + rows_needed * row_height + bottom_margin)
 
     page = doc.new_page(width=label_width, height=label_height)
     shape = page.new_shape()
@@ -93,23 +96,30 @@ def draw_label_page(doc, row):
 
     test_date_str = row["TestDate"] if pd.notna(row["TestDate"]) else ""
 
-    shape.insert_text((10, 15), f"ID: {row['SampleID']}", fontsize=10)
-    shape.insert_text((10, 28), f"Test Date: {test_date_str}", fontsize=8)
+    shape.insert_text((10, 20), f"ID: {row['SampleID']}", fontsize=15)
+    shape.insert_text((10, 34), f"Test Date: {test_date_str}", fontsize=12)
 
-    y = top_margin
-    for test in project_tests:
-        box = fitz.Rect(10, y, 18, y + 8)
+    # Two-column layout for checkboxes
+    col_gap = 10
+    col_width = (label_width - 20 - col_gap) / 2  # 20 = left/right margins
+    col_x = [10, 10 + col_width + col_gap]
+
+    for i, test in enumerate(project_tests):
+        col = i % 2
+        row_idx = i // 2
+        x = col_x[col]
+        y = top_margin + row_idx * row_height
+
+        box = fitz.Rect(x, y, x + 8, y + 8)
         shape.draw_rect(box)
         #if test == row["TestType"]:
         #    shape.draw_line(box.top_left, box.bottom_right)
         #    shape.draw_line(box.bottom_left, box.top_right)
-        shape.insert_text((22, y + 7), test, fontsize=8)
-        y += row_height
+        shape.insert_text((x + 12, y + 7), test, fontsize=8)
 
     shape.finish(width=0.5)
     shape.commit()
     return page
-
 
 app_ui = ui.page_sidebar(
     ui.sidebar(
@@ -203,7 +213,7 @@ def server(input, output, session):
         pix.save(preview_path)
         doc.close()
 
-        return {"src": preview_path, "width": pix.width // 2, "height": pix.height // 2}
+        return {"src": preview_path, "width": pix.width // 1, "height": pix.height // 1}
 
     @render.download(filename="labels.pdf")
     def download_label():

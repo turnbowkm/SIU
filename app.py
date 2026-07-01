@@ -94,10 +94,10 @@ def draw_label_page(doc, row):
     shape = page.new_shape()
     shape.draw_rect(fitz.Rect(2, 2, label_width - 2, label_height - 2))
 
-    test_date_str = row["TestDate"] if pd.notna(row["TestDate"]) else ""
+    sample_date_str = row["SampleDate"] if pd.notna(row["SampleDate"]) else ""
 
     shape.insert_text((10, 15), f"ID: {row['SampleID']}", fontsize=15)
-    shape.insert_text((10, 34), f"Test Date: {test_date_str}", fontsize=12)
+    shape.insert_text((10, 34), f"Sample Date: {sample_date_str}", fontsize=12)
 
     # Two-column layout for checkboxes
     col_gap = 10

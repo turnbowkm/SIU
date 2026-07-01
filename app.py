@@ -67,6 +67,50 @@ def save_samples(df):
 
     os.replace(tmp_path, DATA_FILE)
 
+def get_project_tests(project):
+    matches = config_df.loc[config_df["Project"] == project, "DefaultTests"]
+    if matches.empty:
+        return []
+    return [t.strip() for t in matches.values[0].split(",")]
+
+
+def draw_label_page(doc, row):
+    """Draws one label page for a single sample/test record row.
+    Shared by both the download PDF and the live preview so they can
+    never drift out of sync with each other.
+    """
+    label_width = 216
+    top_margin = 44  # space reserved for ID / Test Date lines
+    row_height = 12  # vertical space per test checkbox line
+    bottom_margin = 8
+
+    project_tests = get_project_tests(row["Project"]) or [row["TestType"]]
+    label_height = max(72, top_margin + len(project_tests) * row_height + bottom_margin)
+
+    page = doc.new_page(width=label_width, height=label_height)
+    shape = page.new_shape()
+    shape.draw_rect(fitz.Rect(2, 2, label_width - 2, label_height - 2))
+
+    test_date_str = row["TestDate"] if pd.notna(row["TestDate"]) else ""
+
+    shape.insert_text((10, 15), f"ID: {row['SampleID']}", fontsize=10)
+    shape.insert_text((10, 28), f"Test Date: {test_date_str}", fontsize=8)
+
+    y = top_margin
+    for test in project_tests:
+        box = fitz.Rect(10, y, 18, y + 8)
+        shape.draw_rect(box)
+        #if test == row["TestType"]:
+        #    shape.draw_line(box.top_left, box.bottom_right)
+        #    shape.draw_line(box.bottom_left, box.top_right)
+        shape.insert_text((22, y + 7), test, fontsize=8)
+        y += row_height
+
+    shape.finish(width=0.5)
+    shape.commit()
+    return page
+
+
 app_ui = ui.page_sidebar(
     ui.sidebar(
         ui.input_select("user", "User:", choices=sorted(config_df["User"].unique().tolist())),
@@ -80,6 +124,10 @@ app_ui = ui.page_sidebar(
     ui.card(
         ui.card_header("Test Records (One record per test)"),
         ui.output_data_frame("sample_table"),
+    ),
+    ui.card(
+        ui.card_header("Label Preview (select a row to preview its label)"),
+        ui.output_image("label_preview"),
     ),
     ui.download_button("download_label", "Download Selected Labels"),
 )
@@ -130,6 +178,33 @@ def server(input, output, session):
         samples.set(df)
         save_samples(df)
 
+    @render.image
+    def label_preview():
+        selection = sample_table.cell_selection()
+        selected_indices = selection["rows"]
+        if not selected_indices:
+            return None
+
+        df = samples.get()
+        # Preview just the first selected row - previewing every selected
+        # row would mean re-rendering an image on every click for
+        # potentially dozens of rows, which is wasted work for a sanity
+        # check. The download still exports all selected rows.
+        row = df.iloc[list(selected_indices)[0]]
+
+        doc = fitz.open()
+        page = draw_label_page(doc, row)
+        # Render at a higher zoom than the label's actual point size so
+        # small text is legible on screen.
+        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            preview_path = tmp.name
+        pix.save(preview_path)
+        doc.close()
+
+        return {"src": preview_path, "width": pix.width // 2, "height": pix.height // 2}
+
     @render.download(filename="labels.pdf")
     def download_label():
         selection = sample_table.cell_selection()
@@ -144,40 +219,8 @@ def server(input, output, session):
         label_rows = df.iloc[list(selected_indices)]
 
         doc = fitz.open()
-        label_width = 216
-        top_margin = 44  # space reserved for ID / Test Date lines
-        row_height = 12  # vertical space per test checkbox line
-        bottom_margin = 8
-
         for _, row in label_rows.iterrows():
-            # Full test list for this record's project, so every label shows
-            # every possible test, with this record's test checked off.
-            matches = config_df.loc[config_df["Project"] == row["Project"], "DefaultTests"]
-            project_tests = [t.strip() for t in matches.values[0].split(",")] if not matches.empty else [row["TestType"]]
-
-            label_height = max(72, top_margin + len(project_tests) * row_height + bottom_margin)
-            page = doc.new_page(width=label_width, height=label_height)
-            shape = page.new_shape()
-            shape.draw_rect(fitz.Rect(2, 2, label_width - 2, label_height - 2))
-
-            test_date_str = row["TestDate"] if pd.notna(row["TestDate"]) else ""
-
-            shape.insert_text((10, 15), f"ID: {row['SampleID']}", fontsize=10)
-            shape.insert_text((10, 28), f"Test Date: {test_date_str}", fontsize=8)
-
-            y = top_margin
-            for test in project_tests:
-                box = fitz.Rect(10, y, 18, y + 8)
-                shape.draw_rect(box)
-                if test == row["TestType"]:
-                    # Mark the test that applies to this record
-                    shape.draw_line(box.top_left, box.bottom_right)
-                    shape.draw_line(box.bottom_left, box.top_right)
-                shape.insert_text((22, y + 7), test, fontsize=8)
-                y += row_height
-
-            shape.finish(width=0.5)
-            shape.commit()
+            draw_label_page(doc, row)
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             output_path = tmp.name

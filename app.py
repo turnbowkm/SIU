@@ -12,8 +12,8 @@ config_df = pd.read_csv("config.csv")
 DATA_FILE = "samples_data.csv"
 BACKUP_FILE = "samples_data.csv.bak"
 CORRUPT_FILE = "samples_data.csv.corrupt"
-DATA_COLUMNS = ["SampleID", "User", "Project", "SampleDate", "TestDate", "TestType"]
-
+DATA_COLUMNS = ["SampleID", "User", "Project", "Site", "SampleDate", "TestDate", "TestType"]
+_last_preview_path = None  # module-level, not reactive.Value
 
 def load_samples():
     if os.path.exists(DATA_FILE):
@@ -23,10 +23,6 @@ def load_samples():
                 df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
             return df
         except Exception:
-            # Main file is unreadable/corrupted (e.g. disk fault unrelated
-            # to our own write, since writes are atomic). Preserve the bad
-            # file for inspection instead of silently deleting it, then try
-            # the backup before giving up and starting fresh.
             try:
                 os.replace(DATA_FILE, CORRUPT_FILE)
             except OSError:
@@ -40,32 +36,20 @@ def load_samples():
             return df
         except Exception:
             pass
-
     return pd.DataFrame(columns=DATA_COLUMNS)
 
-
 def save_samples(df):
-    # Power-loss-safe write for kiosk use: write to a temp file in the same
-    # directory, fsync it to force bytes onto disk (not just OS buffers),
-    # then atomically replace the real file. This guarantees DATA_FILE is
-    # always either the previous complete version or the new complete
-    # version - never a partial/corrupted write, even if power cuts out
-    # mid-save.
     tmp_path = DATA_FILE + ".tmp"
     df.to_csv(tmp_path, index=False)
     with open(tmp_path, "rb+") as f:
         f.flush()
         os.fsync(f.fileno())
 
-    # Rotate current good file to .bak before replacing it, so there's
-    # always a fallback copy even if something outside this code damages
-    # the live file later.
     if os.path.exists(DATA_FILE):
         try:
             os.replace(DATA_FILE, BACKUP_FILE)
         except OSError:
             pass
-
     os.replace(tmp_path, DATA_FILE)
 
 def get_project_tests(project):
@@ -74,49 +58,37 @@ def get_project_tests(project):
         return []
     return [t.strip() for t in matches.values[0].split(",")]
 
-
 def draw_label_page(doc, row):
-    """Draws one label page for a single sample/test record row.
-    Shared by both the download PDF and the live preview so they can
-    never drift out of sync with each other.
-    """
     label_width = 300
-    top_margin = 48  # space reserved for ID / Test Date lines
-    row_height = 26  # vertical space per test checkbox line
+    top_margin = 48
+    row_height = 26
     bottom_margin = 8
 
     project_tests = get_project_tests(row["Project"]) or [row["TestType"]]
     num_tests = len(project_tests)
-    rows_needed = math.ceil(num_tests / 2)  # 2 columns
+    rows_needed = math.ceil(num_tests / 2)
     label_height = max(72, top_margin + rows_needed * row_height + bottom_margin)
 
     page = doc.new_page(width=label_width, height=label_height)
     shape = page.new_shape()
     shape.draw_rect(fitz.Rect(2, 2, label_width - 2, label_height - 2))
 
-    sample_date_str = row["SampleDate"] if pd.notna(row["SampleDate"]) else ""
-
+    sample_date_str = str(row["SampleDate"]) if pd.notna(row["SampleDate"]) else ""
     shape.insert_text((10, 15), f"ID: {row['SampleID']}", fontsize=15)
     shape.insert_text((10, 34), f"Sample Date: {sample_date_str}", fontsize=12)
 
-    # Two-column layout for checkboxes
     col_gap = 10
-    col_width = (label_width - 20 - col_gap) / 2  # 20 = left/right margins
+    col_width = (label_width - 20 - col_gap) / 2
     col_x = [10, 10 + col_width + col_gap]
-
-    box_size = 26  # bigger checkbox
+    box_size = 26
 
     for i, test in enumerate(project_tests):
         col = i % 2
         row_idx = i // 2
         x = col_x[col]
         y = top_margin + row_idx * row_height
-
         box = fitz.Rect(x, y, x + box_size, y + box_size)
         shape.draw_rect(box)
-        #if test == row["TestType"]:
-        #    shape.draw_line(box.top_left, box.bottom_right)
-        #    shape.draw_line(box.bottom_left, box.top_right)
         shape.insert_text((x + box_size + 4, y + box_size - 2), test, fontsize=11)
 
     shape.finish(width=0.5)
@@ -127,52 +99,51 @@ app_ui = ui.page_sidebar(
     ui.sidebar(
         ui.input_select("user", "User:", choices=sorted(config_df["User"].unique().tolist())),
         ui.input_select("project", "Project:", choices=sorted(config_df["Project"].unique().tolist())),
+        ui.output_ui("site_selector"),
         ui.input_date("sample_date", "Sample Date:", value=date.today()),
-        ui.input_date("test_date", "Test Date:", value=None),  # blank by default
+        ui.input_date("test_date", "Test Date:", value=None),
         ui.input_numeric("start_suffix", "Starting Suffix:", value=1),
         ui.input_numeric("count", "Number of Samples:", value=1),
         ui.input_action_button("add_samples", "Add Samples", class_="btn-primary w-100"),
     ),
     ui.card(
-        ui.card_header("Test Records (One record per test)"),
+        ui.card_header("Test Records"),
         ui.output_data_frame("sample_table"),
     ),
     ui.card(
-        ui.card_header("Label Preview (select a row to preview its label)"),
+        ui.card_header("Label Preview"),
         ui.output_image("label_preview"),
     ),
     ui.download_button("download_label", "Download Selected Labels"),
 )
 
-
 def server(input, output, session):
     samples = reactive.Value(load_samples())
+
+    @render.ui
+    def site_selector():
+        project = input.project()
+        raw_values = config_df.loc[config_df["Project"] == project, "Site"].dropna().tolist()
+        sites = sorted({s.strip() for v in raw_values for s in str(v).split(",") if s.strip()})
+        return ui.input_select("site", "Site:", choices=sites)
 
     @reactive.Effect
     @reactive.event(input.add_samples)
     def _():
-        matches = config_df.loc[config_df["Project"] == input.project(), "DefaultTests"]
-        if matches.empty:
-            return
-        test_list = [t.strip() for t in matches.values[0].split(",")]
+        project_data = config_df.loc[config_df["Project"] == input.project()]
+        if project_data.empty: return
+        test_list = [t.strip() for t in project_data.iloc[0]["DefaultTests"].split(",")]
 
         new_data = []
         for i in range(input.count()):
             suffix = input.start_suffix() + i
-            sample_id = f"{input.project()}-{input.sample_date().strftime('%Y%m%d')}-{suffix:03d}"
-
+            sample_id = f"{input.project()}-{input.site()}-{input.sample_date().strftime('%Y%m%d')}-{suffix:03d}"
             for test in test_list:
-                new_data.append(
-                    {
-                        "SampleID": sample_id,
-                        "User": input.user(),
-                        "Project": input.project(),
-                        "SampleDate": input.sample_date(),
-                        "TestDate": input.test_date(),  # may be None
-                        "TestType": test,
-                    }
-                )
-
+                new_data.append({
+                    "SampleID": sample_id, "User": input.user(), "Project": input.project(),
+                    "Site": input.site(), "SampleDate": input.sample_date(),
+                    "TestDate": input.test_date(), "TestType": test,
+                })
         updated_df = pd.concat([samples.get(), pd.DataFrame(new_data)], ignore_index=True)
         samples.set(updated_df)
         save_samples(updated_df)
@@ -190,55 +161,48 @@ def server(input, output, session):
         samples.set(df)
         save_samples(df)
 
+
+
     @render.image
     def label_preview():
-        selection = sample_table.cell_selection()
-        selected_indices = selection["rows"]
+        global _last_preview_path
+        selected_indices = input.sample_table_selected_rows()
         if not selected_indices:
             return None
-
-        df = samples.get()
-        # Preview just the first selected row - previewing every selected
-        # row would mean re-rendering an image on every click for
-        # potentially dozens of rows, which is wasted work for a sanity
-        # check. The download still exports all selected rows.
-        row = df.iloc[list(selected_indices)[0]]
+        row = samples.get().iloc[list(selected_indices)[0]]
 
         doc = fitz.open()
         page = draw_label_page(doc, row)
-        # Render at a higher zoom than the label's actual point size so
-        # small text is legible on screen.
         pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
 
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            preview_path = tmp.name
-        pix.save(preview_path)
+        if _last_preview_path and os.path.exists(_last_preview_path):
+            try:
+                os.remove(_last_preview_path)
+            except OSError:
+                pass
+
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        pix.save(path)
         doc.close()
 
-        return {"src": preview_path, "width": pix.width // 1, "height": pix.height // 1}
+        _last_preview_path = path
+        return {"src": path, "width": pix.width, "height": pix.height}
 
     @render.download(filename="labels.pdf")
     def download_label():
-        selection = sample_table.cell_selection()
-        selected_indices = selection["rows"]
+        selected_indices = input.sample_table_selected_rows()
         if not selected_indices:
             return
-
-        df = samples.get()
-        # One label per selected row. If the same SampleID appears on multiple
-        # rows (e.g. one row per test), selecting all of them prints one
-        # duplicate label per record, as intended.
-        label_rows = df.iloc[list(selected_indices)]
+        label_rows = samples.get().iloc[list(selected_indices)] 
 
         doc = fitz.open()
         for _, row in label_rows.iterrows():
-            draw_label_page(doc, row)
+            draw_label_page(doc, row)   
 
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            output_path = tmp.name
-        doc.save(output_path)
-        doc.close()
-        return output_path
+        pdf_bytes = doc.tobytes()
+        doc.close() 
 
+        yield pdf_bytes 
 
 app = App(app_ui, server)

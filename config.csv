@@ -1,5 +1,5 @@
-User,Project,DefaultTests
-Kehinde,Wascob1,"Filter, DRP, Total P, TSS, NH4"
-Durga,Wascob2,"Filter, DRP, Total P, TSS, NH5"
-Julie,Wascob3,"Filter, DRP, Total P, TSS, NH6"
-Emma,Streambank,"Filter, DRP, Total P, TSS, NH7"
+User	Project	Site	DefaultTests
+Kehinde	Wascob1	A, B, C, D	Filter, DRP, Total P, TSS, NH4
+Durga	Wascob2	A, B, C, D	Filter, DRP, Total P, TSS, NH4
+Julie	Wascob3	A, B, C, D	Filter, DRP, Total P, TSS, NH4
+Emma	Streambank	A, B, C, D	Filter, DRP, Total P, TSS, NH4

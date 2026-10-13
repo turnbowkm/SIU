@@ -6,6 +6,9 @@ import tempfile
 import os
 import math
 import io
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, timedelta
 from barcode import Code128
 from barcode.writer import ImageWriter
 
@@ -18,6 +21,19 @@ DATA_COLUMNS = ["SampleID", "User", "Project", "Site", "SampleDate", "TestDate",
                 "CompletedDate", "CompletedBy", "Comment"]
 DATE_COLUMNS = ("SampleDate", "TestDate", "CompletedDate")
 TEXT_COLUMNS = ("CompletedDate", "CompletedBy", "Comment")
+
+SUPPLIES_FILE = "supplies.csv"            # you enter Barcode,Name,Lot,Expiration (YYYY-MM-DD); every scan appends a new row with UsedAt + Test (sample ID)
+SUPPLY_COLUMNS = ["Barcode", "Name", "Lot", "Expiration", "UsedAt", "Test"]
+EXPIRY_WARN_DAYS = 14                     # flag "expiring soon" within this many days
+
+MANAGER_EMAIL = ""                        # empty = no email, log + on-screen warning only
+SMTP_HOST = "smtp.example.com"
+SMTP_PORT = 587
+SMTP_USER = ""
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = SMTP_USER
+
+RELEASE_CODE = "RELEASE"                  # scan this code to release the active sample
 
 LABEL_WIDTH = 300
 ROW_HEIGHT = 26
@@ -82,6 +98,81 @@ def get_project_tests(project):
     return [t.strip() for t in matches.values[0].split(",")]
 
 
+def _norm(v):
+    # tolerant barcode compare: ignore whitespace, case and leading zeros (Excel strips them)
+    return str(v).strip().lstrip("0").upper()
+
+
+def _blank(v):
+    return pd.isna(v) or str(v).strip() == ""
+
+
+def load_supplies():
+    """All rows: inventory rows (UsedAt blank) plus one appended row per scan."""
+    if os.path.exists(SUPPLIES_FILE):
+        df = pd.read_csv(SUPPLIES_FILE, dtype=str)
+    else:
+        df = pd.DataFrame(columns=SUPPLY_COLUMNS)
+    for c in SUPPLY_COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+        df[c] = df[c].astype(object)
+    for c in ("Barcode", "Name", "Lot"):
+        df[c] = df[c].fillna("").astype(str).str.strip()
+    df["Expiration"] = pd.to_datetime(df["Expiration"], errors="coerce").dt.date.astype(object)
+    return df[SUPPLY_COLUMNS]
+
+
+def save_supplies(df):
+    tmp_path = SUPPLIES_FILE + ".tmp"
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, SUPPLIES_FILE)
+
+
+def is_expired(exp, on=None):
+    # missing/unparseable expiration is treated as expired
+    return pd.isna(exp) or exp < (on or date.today())
+
+
+def record_supply_use(code, sample_id, user):
+    """Look up a scanned chemical barcode. Returns None if unknown, else an info dict.
+    If sample_id is set, appends a new row to supplies.csv for this scan."""
+    sup = load_supplies()
+    inv = sup.loc[sup["UsedAt"].map(_blank) & (sup["Barcode"].map(_norm) == _norm(code))]
+    if inv.empty:
+        return None
+    r = inv.iloc[0]
+    exp = r["Expiration"]
+    info = {"name": r["Name"], "lot": r["Lot"], "barcode": r["Barcode"],
+            "exp": None if pd.isna(exp) else exp, "expired": bool(is_expired(exp)),
+            "soon": (not is_expired(exp)) and exp <= date.today() + timedelta(days=EXPIRY_WARN_DAYS),
+            "logged": False, "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    if not sample_id:
+        return info
+
+    new_row = {"Barcode": r["Barcode"], "Name": r["Name"], "Lot": r["Lot"], "Expiration": exp,
+               "UsedAt": info["time"], "Test": sample_id}
+    save_supplies(pd.concat([sup, pd.DataFrame([new_row])], ignore_index=True))
+    info["logged"] = True
+    return info
+
+
+def send_alert(subject, body):
+    if not (MANAGER_EMAIL and SMTP_HOST and SMTP_USER):
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"], msg["From"], msg["To"] = subject, SMTP_FROM or SMTP_USER, MANAGER_EMAIL
+        msg.set_content(body)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
+            smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+
 def make_barcode_png(text):
     buf = io.BytesIO()
     Code128(text, writer=ImageWriter()).write(
@@ -125,7 +216,9 @@ def draw_label_page(doc, row):
 
 app_ui = ui.page_sidebar(
     ui.sidebar(
-        ui.input_text("scan", "Scan Sample ID:", placeholder="Scan barcode...", update_on="blur"),
+        ui.input_text("scan", "Scan:", placeholder="Sample or chemical barcode..."),
+        ui.output_text("active_label"),
+        ui.input_action_button("release", "Release Active Sample", class_="btn-outline-secondary w-100"),
         ui.input_select("user", "User:", choices=sorted(config_df["User"].unique().tolist())),
         ui.input_select("project", "Project:", choices=sorted(config_df["Project"].unique().tolist())),
         ui.output_ui("site_selector"),
@@ -135,6 +228,26 @@ app_ui = ui.page_sidebar(
         ui.input_numeric("count", "Number of Samples:", value=1),
         ui.input_action_button("add_samples", "Add Samples", class_="btn-primary w-100"),
     ),
+    ui.tags.script("""
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && (e.target.id === 'scan' || e.target.id === 'scan_modal')) {
+    e.preventDefault();
+    var v = e.target.value.trim();
+    e.target.value = '';
+    if (v) Shiny.setInputValue('scan_event', {code: v, t: Date.now()}, {priority: 'event'});
+  }
+});
+function focusScan() {
+  var el = document.getElementById('scan_modal') || document.getElementById('scan');
+  if (el) el.focus();
+}
+Shiny.addCustomMessageHandler('focus_scan', function(m) { focusScan(); });
+document.addEventListener('shown.bs.modal', focusScan);
+document.addEventListener('hidden.bs.modal', function() {
+  var el = document.getElementById('scan'); if (el) el.focus();
+});
+$(document).on('shiny:connected', focusScan);
+"""),
     ui.card(
         ui.card_header("Test Records"),
         ui.output_data_frame("sample_table"),
@@ -150,6 +263,7 @@ app_ui = ui.page_sidebar(
 def server(input, output, session):
     samples = reactive.Value(load_samples())
     scanned_id = reactive.Value(None)
+    completed_user = reactive.Value(None)
 
     @render.ui
     def site_selector():
@@ -193,44 +307,121 @@ def server(input, output, session):
         save_samples(df)
 
     # ---------- scan flow ----------
+    usage_tick = reactive.Value(0)
+
     @reactive.Effect
-    @reactive.event(input.scan)
-    def _():
-        sid = (input.scan() or "").strip()
-        if not sid:
+    @reactive.event(input.scan_event)
+    async def _():
+        await session.send_custom_message("focus_scan", {})
+        code = ((input.scan_event() or {}).get("code") or "").strip()
+        if not code:
             return
-        rows = samples.get().loc[lambda d: d["SampleID"] == sid]
-        ui.update_text("scan", value="")
+        if code == RELEASE_CODE:
+            scanned_id.set(None)
+            ui.notification_show("Active sample released.", duration=3)
+            return
+
+        info = record_supply_use(code, scanned_id.get(), completed_user.get() or input.user())
+        if info is not None:
+            label = f"{info['name']} (Lot {info['lot']})"
+            if info["expired"]:
+                exp_txt = f"exp {info['exp']}" if info["exp"] else "no expiration date"
+                if info["logged"]:
+                    sid = scanned_id.get()
+                    sent = send_alert(
+                        f"Expired supply used: {label}",
+                        f"Sample: {sid}\nSupply: {label}\nBarcode: {code}\nExpiration: {info['exp'] or 'none'}\n"
+                        f"User: {completed_user.get() or input.user()}\nTime: {info['time']}")
+                    ui.notification_show(
+                        f"EXPIRED: {label}, {exp_txt}. Logged to {sid}; "
+                        + ("manager emailed." if sent else "manager email NOT sent (check SMTP config)."),
+                        type="error", duration=None)
+                else:
+                    ui.notification_show(f"EXPIRED: {label}, {exp_txt}. NOT logged: scan a sample ID first.",
+                                         type="error", duration=None)
+            elif not info["logged"]:
+                ui.notification_show(f"{label} NOT logged: scan a sample ID first.", type="error", duration=10)
+            else:
+                msg = f"Logged {label} to {scanned_id.get()}."
+                if info["soon"]:
+                    msg += f" Expires {info['exp']}."
+                ui.notification_show(msg, type="warning" if info["soon"] else "message", duration=5)
+            usage_tick.set(usage_tick.get() + 1)
+            return
+
+        rows = samples.get().loc[lambda d: d["SampleID"] == code]
         if rows.empty:
-            ui.notification_show(f"Unknown ID: {sid}", type="warning")
+            ui.notification_show(f"Unknown code: {code}", type="warning")
             return
-        scanned_id.set(sid)
+        scanned_id.set(code)
         pending = rows.loc[rows["CompletedDate"].isna(), "TestType"].tolist()
         prior = rows["Comment"].dropna()
+        owners = rows["User"].dropna()
+        sample_user = owners.iloc[0] if len(owners) else input.user()
+        completed_user.set(sample_user)
+        users = sorted(set(config_df["User"].unique().tolist()) | {sample_user})
         ui.modal_show(ui.modal(
+            ui.input_text("scan_modal", "Scan chemicals:", placeholder="Chemical barcode..."),
+            ui.h6("Supplies used"),
+            ui.output_ui("sample_supplies"),
             ui.input_checkbox_group("done_tests", "Tests completed:", choices=pending),
+            ui.input_select("completed_by", "Completed by:", choices=users, selected=sample_user),
             ui.input_text_area("scan_comment", "Comment:", value=prior.iloc[0] if len(prior) else ""),
             ui.download_button("download_dup", "Print Duplicate Label"),
-            title=sid,
+            title=code,
             footer=ui.TagList(ui.modal_button("Cancel"),
                               ui.input_action_button("scan_save", "Save", class_="btn-primary")),
         ))
 
     @reactive.Effect
+    @reactive.event(input.completed_by)
+    def _():
+        completed_user.set(input.completed_by())
+
+    @reactive.Effect
+    @reactive.event(input.release)
+    def _():
+        scanned_id.set(None)
+        completed_user.set(None)
+        ui.notification_show("Active sample released.", duration=3)
+
+    @render.text
+    def active_label():
+        return f"Active sample: {scanned_id.get()}" if scanned_id.get() else "Active sample: none"
+
+    @render.ui
+    def sample_supplies():
+        usage_tick.get()
+        sid = scanned_id.get()
+        sup = load_supplies()
+        used = sup.loc[~sup["UsedAt"].map(_blank) & (sup["Test"] == sid)] if sid else sup.iloc[0:0]
+        if used.empty:
+            return ui.p("None yet.")
+        items = []
+        for _, r in used.iterrows():
+            bad = bool(is_expired(r["Expiration"], pd.to_datetime(r["UsedAt"]).date()))
+            items.append(ui.tags.li(f"{r['Name']} (Lot {r['Lot']}) at {r['UsedAt']}" + (" - EXPIRED" if bad else ""),
+                                    class_="text-danger" if bad else None))
+        return ui.tags.ul(*items)
+
+    @reactive.Effect
     @reactive.event(input.scan_save)
     def _():
         sid = scanned_id.get()
+        if not sid:
+            return
         df = samples.get().copy()
         mask = df["SampleID"] == sid
         tmask = mask & df["TestType"].isin(list(input.done_tests() or []))
         df.loc[tmask, "CompletedDate"] = date.today()
-        df.loc[tmask, "CompletedBy"] = input.user()
+        df.loc[tmask, "CompletedBy"] = input.completed_by() or completed_user.get()
         comment = (input.scan_comment() or "").strip()
         if comment:
             df.loc[mask, "Comment"] = comment
         samples.set(df)
         save_samples(df)
         ui.modal_remove()
+        ui.notification_show(f"Saved {sid}.", duration=3)
 
     @render.download(filename=lambda: f"{scanned_id.get()}.pdf")
     def download_dup():

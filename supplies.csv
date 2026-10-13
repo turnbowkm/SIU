@@ -1,0 +1,8 @@
+Barcode,Name,Lot,Expiration,UsedAt,Test
+0012345,pH buffer 7,L123,2026-12-31,,
+0067890,Nitrate reagent,N77,2027-06-30,,
+0055555,Phosphate reagent,P9,2026-11-15,,
+0012345,pH buffer 7,L123,2026-12-31,2026-10-12 22:55:03,Streambank-A-20261012-001
+0055555,Phosphate reagent,P9,2026-11-15,2026-10-12 22:56:19,Streambank-A-20261012-001
+0055555,Phosphate reagent,P9,2026-11-15,2026-10-12 23:04:28,Streambank-A-20261012-001
+0055555,Phosphate reagent,P9,2026-11-15,2026-10-12 23:06:53,Wascob1-A-20261022-223

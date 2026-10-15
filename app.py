@@ -9,8 +9,7 @@ import io
 import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timedelta
-from barcode import Code128
-from barcode.writer import ImageWriter
+import qrcode
 
 # ---------------- CONFIG ----------------
 CONFIG_FILE = "config.csv"
@@ -35,12 +34,19 @@ SMTP_FROM = SMTP_USER
 
 RELEASE_CODE = "RELEASE"                  # scan this code to release the active sample
 
-LABEL_WIDTH = 300
-ROW_HEIGHT = 26
-BOTTOM_MARGIN = 8
-BOX_SIZE = 26
-BARCODE_HEIGHT = 30   # pt
-BARCODE_TOP = 40      # pt, below the date line
+LABEL_WIDTH = 216                         # 3 in, in pt
+LABEL_HEIGHT = 72                         # 1 in, in pt
+ROW_HEIGHT = 13                           # test checkbox rows on the text label
+BOTTOM_MARGIN = 4
+BOX_SIZE = 11
+TEST_COLS = 3
+TEST_FONT = 8
+TEXT_TESTS_TOP = 32                       # pt, where checkbox rows start on the text label
+QR_MARGIN = 4                            # pt, around the QR on the QR label
+QR_BOX_SIZE = 10                          # px per module in the PNG
+QR_BORDER = 2                             # modules of quiet zone
+QR_ERROR = qrcode.constants.ERROR_CORRECT_M   # L, M, Q or H
+SCAN_ACCEPT_TAB = False      # True if scanner sends Tab instead of Enter
 # ----------------------------------------
 
 config_df = pd.read_csv(CONFIG_FILE)
@@ -173,50 +179,55 @@ def send_alert(subject, body):
         return False
 
 
-def make_barcode_png(text):
+def make_qr_png(text):
+    qr = qrcode.QRCode(error_correction=QR_ERROR, box_size=QR_BOX_SIZE, border=QR_BORDER)
+    qr.add_data(text)
+    qr.make(fit=True)
     buf = io.BytesIO()
-    Code128(text, writer=ImageWriter()).write(
-        buf, options={"write_text": False, "module_height": 8, "module_width": 0.25,
-                      "quiet_zone": 2, "dpi": 300})
+    qr.make_image(fill_color="black", back_color="white").save(buf, format="PNG")
     return buf.getvalue()
 
 
 def draw_label_page(doc, row):
-    top_margin = BARCODE_TOP + BARCODE_HEIGHT + 6
+    """Two 3x1 in labels per sample: page 1 = QR only, page 2 = readable text + test boxes."""
+    bpage = doc.new_page(width=LABEL_WIDTH, height=LABEL_HEIGHT)
+    side = LABEL_HEIGHT - 2 * QR_MARGIN
+    x0 = (LABEL_WIDTH - side) / 2
+    bpage.insert_image(
+        fitz.Rect(x0, QR_MARGIN, x0 + side, QR_MARGIN + side),
+        stream=make_qr_png(str(row["SampleID"])), keep_proportion=True)
 
     project_tests = get_project_tests(row["Project"]) or [row["TestType"]]
-    rows_needed = math.ceil(len(project_tests) / 2)
-    label_height = max(72, top_margin + rows_needed * ROW_HEIGHT + BOTTOM_MARGIN)
+    max_tests = TEST_COLS * ((LABEL_HEIGHT - TEXT_TESTS_TOP - BOTTOM_MARGIN) // ROW_HEIGHT)
+    if len(project_tests) > max_tests:
+        print(f"WARNING: {len(project_tests)} tests but only {max_tests} fit on the label")
 
-    page = doc.new_page(width=LABEL_WIDTH, height=label_height)
+    page = doc.new_page(width=LABEL_WIDTH, height=LABEL_HEIGHT)
     shape = page.new_shape()
-    shape.draw_rect(fitz.Rect(2, 2, LABEL_WIDTH - 2, label_height - 2))
+    shape.draw_rect(fitz.Rect(2, 2, LABEL_WIDTH - 2, LABEL_HEIGHT - 2))
 
     sample_date_str = str(row["SampleDate"]) if pd.notna(row["SampleDate"]) else ""
-    shape.insert_text((10, 18), f"ID: {row['SampleID']}", fontsize=15)
-    shape.insert_text((10, 34), f"Sample Date: {sample_date_str}", fontsize=12)
+    shape.insert_text((8, 14), f"ID: {row['SampleID']}", fontsize=10)
+    shape.insert_text((8, 26), f"Sample Date: {sample_date_str}", fontsize=9)
 
-    col_gap = 10
-    col_width = (LABEL_WIDTH - 20 - col_gap) / 2
-    col_x = [10, 10 + col_width + col_gap]
-
+    col_gap = 6
+    col_width = (LABEL_WIDTH - 16 - col_gap * (TEST_COLS - 1)) / TEST_COLS
     for i, test in enumerate(project_tests):
-        x = col_x[i % 2]
-        y = top_margin + (i // 2) * ROW_HEIGHT
+        x = 8 + (i % TEST_COLS) * (col_width + col_gap)
+        y = TEXT_TESTS_TOP + (i // TEST_COLS) * ROW_HEIGHT
         shape.draw_rect(fitz.Rect(x, y, x + BOX_SIZE, y + BOX_SIZE))
-        shape.insert_text((x + BOX_SIZE + 4, y + BOX_SIZE - 2), test, fontsize=11)
+        shape.insert_text((x + BOX_SIZE + 3, y + BOX_SIZE - 2), test, fontsize=TEST_FONT)
 
     shape.finish(width=0.5)
     shape.commit()
-    page.insert_image(
-        fitz.Rect(10, BARCODE_TOP, LABEL_WIDTH - 10, BARCODE_TOP + BARCODE_HEIGHT),
-        stream=make_barcode_png(str(row["SampleID"])), keep_proportion=False)
-    return page
+    return bpage, page
 
+
+SCAN_KEYS = "['Enter','Tab']" if SCAN_ACCEPT_TAB else "['Enter']"
 
 app_ui = ui.page_sidebar(
     ui.sidebar(
-        ui.input_text("scan", "Scan:", placeholder="Sample or chemical barcode..."),
+        ui.input_text("scan", "Scan:", placeholder="Sample or chemical code..."),
         ui.output_text("active_label"),
         ui.input_action_button("release", "Release Active Sample", class_="btn-outline-secondary w-100"),
         ui.input_select("user", "User:", choices=sorted(config_df["User"].unique().tolist())),
@@ -230,7 +241,7 @@ app_ui = ui.page_sidebar(
     ),
     ui.tags.script("""
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'Enter' && (e.target.id === 'scan' || e.target.id === 'scan_modal')) {
+  if (""" + SCAN_KEYS + """.includes(e.key) && (e.target.id === 'scan' || e.target.id === 'scan_modal')) {
     e.preventDefault();
     var v = e.target.value.trim();
     e.target.value = '';
@@ -241,6 +252,11 @@ function focusScan() {
   var el = document.getElementById('scan_modal') || document.getElementById('scan');
   if (el) el.focus();
 }
+document.addEventListener('keydown', function(e) {
+  var t = e.target, tag = (t.tagName || '').toLowerCase();
+  var editable = tag === 'input' || tag === 'textarea' || tag === 'select' || t.isContentEditable;
+  if (!editable && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) focusScan();
+}, true);
 Shiny.addCustomMessageHandler('focus_scan', function(m) { focusScan(); });
 document.addEventListener('shown.bs.modal', focusScan);
 document.addEventListener('hidden.bs.modal', function() {
@@ -314,6 +330,7 @@ def server(input, output, session):
     async def _():
         await session.send_custom_message("focus_scan", {})
         code = ((input.scan_event() or {}).get("code") or "").strip()
+        print(f"scan_event: {code!r}")  # debug: remove once scanning works
         if not code:
             return
         if code == RELEASE_CODE:
@@ -349,10 +366,11 @@ def server(input, output, session):
             usage_tick.set(usage_tick.get() + 1)
             return
 
-        rows = samples.get().loc[lambda d: d["SampleID"] == code]
+        rows = samples.get().loc[lambda d: d["SampleID"].astype(str).str.upper() == code.upper()]
         if rows.empty:
             ui.notification_show(f"Unknown code: {code}", type="warning")
             return
+        code = str(rows.iloc[0]["SampleID"])  # canonical casing
         scanned_id.set(code)
         pending = rows.loc[rows["CompletedDate"].isna(), "TestType"].tolist()
         prior = rows["Comment"].dropna()
@@ -444,8 +462,14 @@ def server(input, output, session):
         row = samples.get().iloc[list(selected_indices)[0]]
 
         doc = fitz.open()
-        page = draw_label_page(doc, row)
-        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
+        draw_label_page(doc, row)
+        gap = 6
+        combo = fitz.open()
+        cp = combo.new_page(width=LABEL_WIDTH, height=2 * LABEL_HEIGHT + gap)
+        cp.show_pdf_page(fitz.Rect(0, 0, LABEL_WIDTH, LABEL_HEIGHT), doc, 0)
+        cp.show_pdf_page(fitz.Rect(0, LABEL_HEIGHT + gap, LABEL_WIDTH, 2 * LABEL_HEIGHT + gap), doc, 1)
+        pix = cp.get_pixmap(matrix=fitz.Matrix(3, 3))
+        combo.close()
 
         if _last_preview_path and os.path.exists(_last_preview_path):
             try:

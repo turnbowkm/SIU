@@ -48,11 +48,23 @@ BOX_SIZE = 11
 TEST_COLS = 3
 TEST_FONT = 8
 TEXT_TESTS_TOP = 32                       # pt, where checkbox rows start on the text label
-QR_MARGIN = 4                            # pt, around the QR on the QR label
+QR_MARGIN = 4                             # pt, around the QR on the QR label
 QR_BOX_SIZE = 10                          # px per module in the PNG
 QR_BORDER = 2                             # modules of quiet zone
 QR_ERROR = qrcode.constants.ERROR_CORRECT_M   # L, M, Q or H
-SCAN_ACCEPT_TAB = False      # True if scanner sends Tab instead of Enter
+SCAN_ACCEPT_TAB = False                   # True if scanner sends Tab instead of Enter
+
+PRINT_PAGE_W = 792                        # letter landscape, pt
+PRINT_PAGE_H = 612
+PRINT_MARGIN = 36
+PRINT_FONT = 8
+PRINT_ROW_H = 14                          # pt per sample row
+PRINT_BOX = 8                             # pt, checkbox size
+PRINT_ID_W = 180                          # pt, Sample ID column
+PRINT_DATE_W = 72                         # pt, Sample Date column
+PRINT_USER_W = 70                         # pt, User column
+PRINT_TEST_COL_MAX = 60                   # pt, max width of each test column (shrinks to fit the page)
+PRINT_DONE_LABEL = "Complete"             # text shown in a test cell once that test is done
 # ----------------------------------------
 
 config_df = pd.read_csv(CONFIG_FILE)
@@ -229,6 +241,134 @@ def draw_label_page(doc, row):
     return bpage, page
 
 
+def all_config_tests():
+    seen = []
+    for v in config_df["DefaultTests"].dropna():
+        for t in str(v).split(","):
+            t = t.strip()
+            if t and t not in seen:
+                seen.append(t)
+    return seen
+
+
+def incomplete_rows(df):
+    return df.loc[df["CompletedDate"].map(_blank)]
+
+
+def incomplete_summary(df):
+    """[(project, DataFrame[TestType, Count, Oldest, Newest], n_samples_pending), ...]"""
+    inc = incomplete_rows(df).copy()
+    inc["SampleDate"] = pd.to_datetime(inc["SampleDate"], errors="coerce")
+    inc["Project"] = inc["Project"].fillna("(none)").astype(str)
+    g = inc.groupby(["Project", "TestType"]).agg(Count=("SampleID", "nunique"),
+                                                 Oldest=("SampleDate", "min"),
+                                                 Newest=("SampleDate", "max"))
+    projects = list(dict.fromkeys(config_df["Project"].dropna().astype(str)))
+    projects += sorted(set(inc["Project"]) - set(projects))
+    out = []
+    for p in projects:
+        cfg_tests = get_project_tests(p)
+        tests = cfg_tests + [t for (pp, t) in g.index if pp == p and t not in cfg_tests]
+        sub = g.reindex(pd.MultiIndex.from_product([[p], tests], names=["Project", "TestType"]))
+        sub["Count"] = sub["Count"].fillna(0).astype(int)
+        sub = sub.reset_index().drop(columns="Project").sort_values(["Count", "TestType"], ascending=[False, True])
+        out.append((p, sub, int(inc.loc[inc["Project"] == p, "SampleID"].nunique())))
+    return out
+
+
+def draw_incomplete_list(doc, df):
+    M, W, H = PRINT_MARGIN, PRINT_PAGE_W, PRINT_PAGE_H
+    inc = incomplete_rows(df)
+    cfg = all_config_tests()
+    found = set(inc["TestType"].astype(str).str.strip())
+    tests = [t for t in cfg if t in found] + sorted(found - set(cfg))
+    done_rows = df.loc[~df["CompletedDate"].map(_blank)]
+    done_by = {str(k): set(g["TestType"].astype(str).str.strip()) for k, g in done_rows.groupby("SampleID")}
+    entries = []
+    for sid, g in inc.groupby("SampleID", sort=False):
+        r = g.iloc[0]
+        entries.append((str(r["SampleDate"]), str(sid), "" if _blank(r["User"]) else str(r["User"]),
+                        set(g["TestType"].astype(str).str.strip()), done_by.get(str(sid), set())))
+    entries.sort(key=lambda e: e[:3])
+    fixed = (M, M + PRINT_ID_W, M + PRINT_ID_W + PRINT_DATE_W)   # ID, sample date, user
+    x0 = M + PRINT_ID_W + PRINT_DATE_W + PRINT_USER_W            # first test column
+    colw = min(PRINT_TEST_COL_MAX, (W - M - x0) / max(len(tests), 1))
+
+    def new_page():
+        p = doc.new_page(width=W, height=H)
+        p.insert_text((M, M), "Incomplete Tests", fontsize=13)
+        p.insert_text((M, M + 14), f"Printed {datetime.now():%Y-%m-%d %H:%M}  |  {len(entries)} samples, {len(inc)} tests pending",
+                      fontsize=PRINT_FONT)
+        y = M + 32
+        for x, h in zip(fixed, ("Sample ID", "Sample Date", "User")):
+            p.insert_text((x, y), h, fontsize=PRINT_FONT + 1, fontname="hebo")
+        for i, t in enumerate(tests):
+            fs = PRINT_FONT + 1
+            while fs > 4 and pymupdf.get_text_length(t, fontname="hebo", fontsize=fs) > colw - 2:
+                fs -= 0.5
+            tw = pymupdf.get_text_length(t, fontname="hebo", fontsize=fs)
+            p.insert_text((x0 + i * colw + (colw - tw) / 2, y), t, fontsize=fs, fontname="hebo")
+        p.draw_line((M, y + 3), (W - M, y + 3), width=0.5)
+        return p, y + PRINT_ROW_H
+
+    page, y = new_page()
+    if not entries:
+        page.insert_text((M, y + 4), "Nothing pending.", fontsize=PRINT_FONT + 2)
+        return
+    for sample_date, sid, user, pend, done in entries:
+        if y + PRINT_ROW_H > H - M:
+            page, y = new_page()
+        for x, txt in zip(fixed, (sid, sample_date, user)):
+            page.insert_text((x, y), txt, fontsize=PRINT_FONT)
+        for i, t in enumerate(tests):
+            if t in pend:
+                bx = x0 + i * colw + (colw - PRINT_BOX) / 2
+                page.draw_rect(pymupdf.Rect(bx, y - PRINT_BOX, bx + PRINT_BOX, y), width=0.5)
+            elif t in done:
+                fs = PRINT_FONT - 1
+                while fs > 4 and pymupdf.get_text_length(PRINT_DONE_LABEL, fontname="helv", fontsize=fs) > colw - 2:
+                    fs -= 0.5
+                tw = pymupdf.get_text_length(PRINT_DONE_LABEL, fontname="helv", fontsize=fs)
+                page.insert_text((x0 + i * colw + (colw - tw) / 2, y), PRINT_DONE_LABEL,
+                                 fontsize=fs, color=(0.35, 0.35, 0.35))
+        page.draw_line((M, y + 4), (W - M, y + 4), color=(0.85, 0.85, 0.85), width=0.3)
+        y += PRINT_ROW_H
+
+
+def draw_test_list(doc, df, test):
+    """Printable checklist of pending samples for one test (df = already-filtered pending rows)."""
+    M, W, H = PRINT_MARGIN, PRINT_PAGE_W, PRINT_PAGE_H
+    rows = sorted((str(r.SampleDate), str(r.SampleID), "" if _blank(r.User) else str(r.User))
+                  for r in df.itertuples())
+    x_id = M + 14
+    x_date = x_id + PRINT_ID_W
+    x_user = x_date + PRINT_DATE_W
+
+    def new_page():
+        p = doc.new_page(width=W, height=H)
+        p.insert_text((M, M), f"{test}: pending", fontsize=13)
+        p.insert_text((M, M + 14), f"Printed {datetime.now():%Y-%m-%d %H:%M}  |  {len(rows)} samples",
+                      fontsize=PRINT_FONT)
+        y = M + 32
+        for x, h in ((x_id, "Sample ID"), (x_date, "Sample Date"), (x_user, "User")):
+            p.insert_text((x, y), h, fontsize=PRINT_FONT + 1, fontname="hebo")
+        p.draw_line((M, y + 3), (W - M, y + 3), width=0.5)
+        return p, y + PRINT_ROW_H
+
+    page, y = new_page()
+    if not rows:
+        page.insert_text((M, y + 4), "Nothing pending.", fontsize=PRINT_FONT + 2)
+        return
+    for sample_date, sid, user in rows:
+        if y + PRINT_ROW_H > H - M:
+            page, y = new_page()
+        page.draw_rect(pymupdf.Rect(M, y - PRINT_BOX, M + PRINT_BOX, y), width=0.5)
+        for x, txt in ((x_id, sid), (x_date, sample_date), (x_user, user)):
+            page.insert_text((x, y), txt, fontsize=PRINT_FONT)
+        page.draw_line((M, y + 4), (W - M, y + 4), color=(0.85, 0.85, 0.85), width=0.3)
+        y += PRINT_ROW_H
+
+
 SCAN_KEYS = "['Enter','Tab']" if SCAN_ACCEPT_TAB else "['Enter']"
 
 app_ui = ui.page_sidebar(
@@ -273,6 +413,20 @@ $(document).on('shiny:connected', focusScan);
     ui.card(
         ui.card_header("Test Records"),
         ui.output_data_frame("sample_table"),
+    ),
+    ui.card(
+        ui.card_header("Complete Tests"),
+        ui.div(
+            ui.input_select("cl_test", None, choices=all_config_tests()),
+            ui.input_action_button("cl_open", "Open list", class_="btn-primary"),
+            class_="d-flex gap-2 align-items-start",
+        ),
+    ),
+    ui.card(
+        ui.card_header("Incomplete Tests ",
+                       ui.download_button("download_incomplete", "Print Incomplete List",
+                                          class_="btn-sm btn-outline-primary float-end")),
+        ui.output_ui("incomplete_chart"),
     ),
     ui.card(
         ui.card_header("Label Preview"),
@@ -328,6 +482,118 @@ def server(input, output, session):
         df.iat[edit["row"], edit["col"]] = edit["value"]
         samples.set(df)
         save_samples(df)
+
+    # ---------- complete-tests window ----------
+    cl_test = reactive.Value(None)
+
+    def _pending_mask(df, test):
+        return (df["TestType"].astype(str).str.strip().str.upper() == str(test).strip().upper()) \
+            & df["CompletedDate"].map(_blank)
+
+    def _pending_choices(test):
+        df = samples.get()
+        pend = df.loc[_pending_mask(df, test)].sort_values(["SampleDate", "SampleID"])
+        return {str(r.SampleID): f"{r.SampleID}  ({r.SampleDate})" for r in pend.itertuples()}
+
+    @reactive.Effect
+    @reactive.event(input.cl_open)
+    def _():
+        test = input.cl_test()
+        choices = _pending_choices(test)
+        if not choices:
+            ui.notification_show(f"No {test} pending.", duration=3)
+            return
+        cl_test.set(test)
+        users = sorted(set(config_df["User"].unique().tolist()) | {input.user()})
+        ui.modal_show(ui.modal(
+            ui.div(
+                ui.input_action_button("cl_all", "Select all", class_="btn-sm btn-outline-secondary"),
+                ui.download_button("cl_print", "Print list", class_="btn-sm btn-outline-primary"),
+                class_="d-flex gap-2 mb-2",
+            ),
+            ui.div(ui.input_checkbox_group("cl_sel", None, choices=choices),
+                   style="max-height:50vh;overflow-y:auto;padding:6px 10px;"),
+            ui.input_date("cl_date", "Completed date:", value=date.today()),
+            ui.input_select("cl_by", "Completed by:", choices=users, selected=input.user()),
+            title=f"{test}: mark completed",
+            footer=ui.TagList(ui.modal_button("Cancel"),
+                              ui.input_action_button("cl_save", "Save", class_="btn-primary")),
+            size="l", easy_close=True,
+        ))
+
+    @reactive.Effect
+    @reactive.event(input.cl_all)
+    def _():
+        ui.update_checkbox_group("cl_sel", selected=list(_pending_choices(cl_test.get())))
+
+    @render.download(filename=lambda: f"{cl_test.get()}_pending.pdf")
+    def cl_print():
+        test = cl_test.get()
+        df = samples.get()
+        doc = pymupdf.open()
+        draw_test_list(doc, df.loc[_pending_mask(df, test)], test)
+        pdf_bytes = doc.tobytes()
+        doc.close()
+        yield pdf_bytes
+
+    @reactive.Effect
+    @reactive.event(input.cl_save)
+    def _():
+        test = cl_test.get()
+        sel = list(input.cl_sel() or [])
+        if not test or not sel:
+            ui.notification_show("Nothing checked.", duration=3)
+            return
+        df = samples.get().copy()
+        m = df["SampleID"].astype(str).isin(sel) & _pending_mask(df, test)
+        df.loc[m, "CompletedDate"] = input.cl_date()
+        df.loc[m, "CompletedBy"] = input.cl_by()
+        samples.set(df)
+        save_samples(df)
+        ui.modal_remove()
+        ui.notification_show(f"{int(m.sum())} {test} marked complete.", duration=3)
+    # -------------------------------------------
+
+    @render.ui
+    def incomplete_chart():
+        groups = incomplete_summary(samples.get())
+        if not groups:
+            return ui.p("No projects configured.")
+        maxc = max(max((int(g["Count"].max()) for _, g, _ in groups if not g.empty), default=1), 1)
+        grid = "display:grid;grid-template-columns:130px 1fr 220px;gap:10px;align-items:center;margin:3px 0;"
+        track = "position:relative;height:14px;background:#eee;border-radius:3px;"
+        rows = [ui.div(
+            ui.div("Test", style="font-weight:600;"),
+            ui.div("Incomplete samples", style="font-weight:600;"),
+            ui.div("Oldest - newest (age)", style="font-weight:600;"),
+            style=grid)]
+        today = pd.Timestamp(date.today())
+        for proj, g, n_samples in groups:
+            rows.append(ui.div(
+                ui.span(proj, style="font-weight:700;"),
+                ui.span(f"  {n_samples} sample{'s' if n_samples != 1 else ''} pending", style="font-size:.85em;color:#666;"),
+                style="margin-top:12px;padding-bottom:2px;border-bottom:1px solid #ccc;"))
+            for _, r in g.iterrows():
+                n = int(r["Count"])
+                bar = ui.div(
+                    ui.div(style=f"width:{100 * n / maxc:.1f}%;height:100%;background:#d9534f;border-radius:3px;"),
+                    ui.span(str(n), style="position:absolute;left:6px;top:-2px;font-size:.8em;font-weight:600;"),
+                    style=track)
+                if n and pd.notna(r["Oldest"]):
+                    txt = f"{r['Oldest'].date()} - {r['Newest'].date()} ({(today - r['Oldest']).days}d)"
+                else:
+                    txt = "-"
+                rows.append(ui.div(ui.div(r["TestType"], style="padding-left:10px;"), bar,
+                                   ui.div(txt, style="font-size:.85em;"), style=grid))
+        return ui.div(*rows)
+
+    @render.download(filename="incomplete_tests.pdf")
+    def download_incomplete():
+        doc = pymupdf.open()
+        draw_incomplete_list(doc, samples.get())
+        pdf_bytes = doc.tobytes()
+        doc.close()
+        yield pdf_bytes
 
     # ---------- scan flow ----------
     usage_tick = reactive.Value(0)
@@ -525,5 +791,6 @@ def server(input, output, session):
         doc.close()
 
         yield pdf_bytes
+
 
 app = App(app_ui, server)

@@ -410,30 +410,48 @@ document.addEventListener('hidden.bs.modal', function() {
 });
 $(document).on('shiny:connected', focusScan);
 """),
-    ui.card(
-        ui.card_header("Test Records"),
-        ui.output_data_frame("sample_table"),
-    ),
-    ui.card(
-        ui.card_header("Complete Tests"),
-        ui.div(
-            ui.input_select("cl_test", None, choices=all_config_tests()),
-            ui.input_action_button("cl_open", "Open list", class_="btn-primary"),
-            class_="d-flex gap-2 align-items-start",
+    ui.navset_tab(
+        ui.nav_panel(
+            "Records",
+            ui.div(
+                ui.card(
+                    ui.card_header("Test Records"),
+                    ui.output_data_frame("sample_table"),
+                ),
+                ui.card(
+                    ui.card_header("Label Preview"),
+                    ui.output_image("label_preview"),
+                ),
+                ui.div(
+                    ui.download_button("download_label", "Download Selected Labels"),
+                    *([ui.download_button("download_sheets", "Download Sample Sheets")] if HAVE_SHEETS else []),
+                    class_="d-flex gap-2",
+                ),
+                class_="pt-3",
+            ),
         ),
+        ui.nav_panel(
+            "Incomplete Tests",
+            ui.div(
+                ui.card(
+                    ui.card_header(
+                        ui.div(
+                            ui.span("Click to Mark Samples as Tested", class_="me-4"),
+                            ui.div(
+                                ui.input_action_button("cl_open", "Complete Tests", class_="btn-sm btn-primary"),
+                                ui.download_button("download_incomplete", "Print Incomplete List",
+                                                   class_="btn-sm btn-outline-primary"),
+                                class_="d-flex gap-2",
+                            ),
+                            class_="d-flex justify-content-between align-items-center flex-wrap gap-4",
+                        )),
+                    ui.output_ui("incomplete_chart"),
+                ),
+                class_="pt-3",
+            ),
+        ),
+        id="main_tabs",
     ),
-    ui.card(
-        ui.card_header("Incomplete Tests ",
-                       ui.download_button("download_incomplete", "Print Incomplete List",
-                                          class_="btn-sm btn-outline-primary float-end")),
-        ui.output_ui("incomplete_chart"),
-    ),
-    ui.card(
-        ui.card_header("Label Preview"),
-        ui.output_image("label_preview"),
-    ),
-    ui.download_button("download_label", "Download Selected Labels"),
-    *([ui.download_button("download_sheets", "Download Sample Sheets")] if HAVE_SHEETS else []),
 )
 
 
@@ -484,54 +502,120 @@ def server(input, output, session):
         save_samples(df)
 
     # ---------- complete-tests window ----------
-    cl_test = reactive.Value(None)
+    def _get_complete_projects(df):
+        inc = incomplete_rows(df)
+        projs = sorted(set(inc["Project"].dropna().astype(str)) | set(config_df["Project"].dropna().astype(str)))
+        return ["(All)"] + projs
 
-    def _pending_mask(df, test):
-        return (df["TestType"].astype(str).str.strip().str.upper() == str(test).strip().upper()) \
+    def _pending_mask(df, test, project=None):
+        m = (df["TestType"].astype(str).str.strip().str.upper() == str(test).strip().upper()) \
             & df["CompletedDate"].map(_blank)
+        if project and project != "(All)":
+            m = m & (df["Project"].astype(str) == str(project))
+        return m
 
-    def _pending_choices(test):
+    def _pending_choices(test, project=None):
         df = samples.get()
-        pend = df.loc[_pending_mask(df, test)].sort_values(["SampleDate", "SampleID"])
+        pend = df.loc[_pending_mask(df, test, project)].sort_values(["SampleDate", "SampleID"])
         return {str(r.SampleID): f"{r.SampleID}  ({r.SampleDate})" for r in pend.itertuples()}
 
     @reactive.Effect
     @reactive.event(input.cl_open)
     def _():
-        test = input.cl_test()
-        choices = _pending_choices(test)
-        if not choices:
-            ui.notification_show(f"No {test} pending.", duration=3)
+        df = samples.get()
+        inc = incomplete_rows(df)
+        projects = _get_complete_projects(df)
+        default_proj = input.project() if input.project() in projects else "(All)"
+        
+        cfg = all_config_tests()
+        tests = cfg + sorted(set(inc["TestType"].dropna().astype(str).str.strip()) - set(cfg))
+        if not tests:
+            ui.notification_show("No tests configured.", duration=3)
             return
-        cl_test.set(test)
+        counts = {t: int(_pending_mask(df, t).sum()) for t in tests}
+        first = max(tests, key=lambda t: counts[t])        # test with the most pending
         users = sorted(set(config_df["User"].unique().tolist()) | {input.user()})
         ui.modal_show(ui.modal(
+            ui.input_select("cl_project", "Project:", choices=projects, selected=default_proj),
+            ui.input_select("cl_test", "Test:", choices={t: f"{t} ({counts[t]} pending)" for t in tests},
+                            selected=first),
             ui.div(
                 ui.input_action_button("cl_all", "Select all", class_="btn-sm btn-outline-secondary"),
                 ui.download_button("cl_print", "Print list", class_="btn-sm btn-outline-primary"),
                 class_="d-flex gap-2 mb-2",
             ),
-            ui.div(ui.input_checkbox_group("cl_sel", None, choices=choices),
-                   style="max-height:50vh;overflow-y:auto;padding:6px 10px;"),
+            ui.output_ui("cl_list"),
             ui.input_date("cl_date", "Completed date:", value=date.today()),
             ui.input_select("cl_by", "Completed by:", choices=users, selected=input.user()),
-            title=f"{test}: mark completed",
+            title="Complete tests",
             footer=ui.TagList(ui.modal_button("Cancel"),
                               ui.input_action_button("cl_save", "Save", class_="btn-primary")),
             size="l", easy_close=True,
         ))
 
     @reactive.Effect
+    @reactive.event(input.cl_project)
+    def _():
+        proj = input.cl_project()
+        df = samples.get()
+        inc = incomplete_rows(df)
+        if proj and proj != "(All)":
+            cfg = get_project_tests(proj)
+            tests = cfg + sorted(set(inc.loc[inc["Project"].astype(str) == proj, "TestType"].dropna().astype(str).str.strip()) - set(cfg))
+            counts = {t: int(_pending_mask(df, t, proj).sum()) for t in tests}
+        else:
+            cfg = all_config_tests()
+            tests = cfg + sorted(set(inc["TestType"].dropna().astype(str).str.strip()) - set(cfg))
+            counts = {t: int(_pending_mask(df, t).sum()) for t in tests}
+        
+        choices = {t: f"{t} ({counts.get(t, 0)} pending)" for t in tests}
+        first = max(tests, key=lambda t: counts.get(t, 0)) if tests else None
+        ui.update_select("cl_test", choices=choices, selected=first)
+
+    @render.ui
+    def cl_list():
+        test = input.cl_test()
+        proj = input.cl_project() if "cl_project" in input else "(All)"
+        choices = _pending_choices(test, proj)
+        if not choices:
+            return ui.p(f"No {test} pending.", class_="text-muted")
+        return ui.div(ui.input_checkbox_group("cl_sel", None, choices=choices),
+                      style="max-height:50vh;overflow-y:auto;padding:6px 10px;")
+
+    @reactive.Effect
     @reactive.event(input.cl_all)
     def _():
-        ui.update_checkbox_group("cl_sel", selected=list(_pending_choices(cl_test.get())))
+        test = input.cl_test()
+        proj = input.cl_project() if "cl_project" in input else "(All)"
+        choices = _pending_choices(test, proj)
+        if not choices:
+            return
+        
+        all_keys = list(choices.keys()) if isinstance(choices, dict) else list(choices)
+        current_sel = input.cl_sel() or []
+        
+        if set(current_sel) == set(all_keys):
+            ui.update_checkbox_group("cl_sel", selected=[])
+            ui.update_action_button("cl_all", label="Select all")
+        else:
+            ui.update_checkbox_group("cl_sel", selected=all_keys)
+            ui.update_action_button("cl_all", label="Deselect all")
 
-    @render.download(filename=lambda: f"{cl_test.get()}_pending.pdf")
+    @reactive.Effect
+    @reactive.event(input.cl_test)
+    def _():
+        test = input.cl_test()
+        proj = input.cl_project() if "cl_project" in input else "(All)"
+        ui.update_action_button("cl_all", label="Select all")
+        ui.update_checkbox_group("cl_sel", selected=list(_pending_choices(test, proj).keys()))
+
+    @render.download(filename=lambda: f"{input.cl_project()}_{input.cl_test()}_pending.pdf")
     def cl_print():
-        test = cl_test.get()
+        test = input.cl_test()
+        proj = input.cl_project() if "cl_project" in input else "(All)"
         df = samples.get()
         doc = pymupdf.open()
-        draw_test_list(doc, df.loc[_pending_mask(df, test)], test)
+        draw_test_list(doc, df.loc[_pending_mask(df, test, proj)], test)
         pdf_bytes = doc.tobytes()
         doc.close()
         yield pdf_bytes
@@ -539,13 +623,14 @@ def server(input, output, session):
     @reactive.Effect
     @reactive.event(input.cl_save)
     def _():
-        test = cl_test.get()
+        test = input.cl_test()
+        proj = input.cl_project() if "cl_project" in input else "(All)"
         sel = list(input.cl_sel() or [])
-        if not test or not sel:
+        if not sel:
             ui.notification_show("Nothing checked.", duration=3)
             return
         df = samples.get().copy()
-        m = df["SampleID"].astype(str).isin(sel) & _pending_mask(df, test)
+        m = df["SampleID"].astype(str).isin(sel) & _pending_mask(df, test, proj)
         df.loc[m, "CompletedDate"] = input.cl_date()
         df.loc[m, "CompletedBy"] = input.cl_by()
         samples.set(df)
@@ -575,9 +660,15 @@ def server(input, output, session):
                 style="margin-top:12px;padding-bottom:2px;border-bottom:1px solid #ccc;"))
             for _, r in g.iterrows():
                 n = int(r["Count"])
+                pct = 100 * n / maxc
+                if pct >= 12:                                   # inside the bar, white
+                    pos, color = "left:6px;", "#fff"
+                else:                                           # just past the bar, dark red (grey if zero)
+                    pos, color = f"left:calc({pct:.1f}% + 6px);", "#a94442" if n else "#888"
                 bar = ui.div(
-                    ui.div(style=f"width:{100 * n / maxc:.1f}%;height:100%;background:#d9534f;border-radius:3px;"),
-                    ui.span(str(n), style="position:absolute;left:6px;top:-2px;font-size:.8em;font-weight:600;"),
+                    ui.div(style=f"width:{pct:.1f}%;height:100%;background:#d9534f;border-radius:3px;"),
+                    ui.span(str(n), style=f"position:absolute;{pos}top:0;line-height:14px;"
+                                          f"font-size:.8em;font-weight:600;color:{color};"),
                     style=track)
                 if n and pd.notna(r["Oldest"]):
                     txt = f"{r['Oldest'].date()} - {r['Newest'].date()} ({(today - r['Oldest']).days}d)"

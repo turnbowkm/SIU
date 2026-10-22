@@ -533,12 +533,20 @@ def server(input, output, session):
             ui.notification_show("No tests configured.", duration=3)
             return
         counts = {t: int(_pending_mask(df, t).sum()) for t in tests}
-        first = max(tests, key=lambda t: counts[t])        # test with the most pending
+        first = max(tests, key=lambda t: counts[t])
         users = sorted(set(config_df["User"].unique().tolist()) | {input.user()})
+        
         ui.modal_show(ui.modal(
-            ui.input_select("cl_project", "Project:", choices=projects, selected=default_proj),
-            ui.input_select("cl_test", "Test:", choices={t: f"{t} ({counts[t]} pending)" for t in tests},
-                            selected=first),
+            ui.div(
+                ui.tags.label("Project:", class_="form-label fw-bold small text-muted mb-1"),
+                ui.input_radio_buttons("cl_project", None, choices=projects, selected=default_proj, inline=True),
+                class_="mb-3",
+            ),
+            ui.div(
+                ui.tags.label("Test:", class_="form-label fw-bold small text-muted mb-1"),
+                ui.input_radio_buttons("cl_test", None, choices={t: f"{t} ({counts[t]})" for t in tests}, selected=first, inline=True),
+                class_="mb-3",
+            ),
             ui.div(
                 ui.input_action_button("cl_all", "Select all", class_="btn-sm btn-outline-secondary"),
                 ui.download_button("cl_print", "Print list", class_="btn-sm btn-outline-primary"),
@@ -568,9 +576,9 @@ def server(input, output, session):
             tests = cfg + sorted(set(inc["TestType"].dropna().astype(str).str.strip()) - set(cfg))
             counts = {t: int(_pending_mask(df, t).sum()) for t in tests}
         
-        choices = {t: f"{t} ({counts.get(t, 0)} pending)" for t in tests}
+        choices = {t: f"{t} ({counts.get(t, 0)})" for t in tests}
         first = max(tests, key=lambda t: counts.get(t, 0)) if tests else None
-        ui.update_select("cl_test", choices=choices, selected=first)
+        ui.update_radio_buttons("cl_test", choices=choices, selected=first)
 
     @render.ui
     def cl_list():
@@ -637,8 +645,7 @@ def server(input, output, session):
         save_samples(df)
         ui.modal_remove()
         ui.notification_show(f"{int(m.sum())} {test} marked complete.", duration=3)
-    # -------------------------------------------
-
+        
     @render.ui
     def incomplete_chart():
         groups = incomplete_summary(samples.get())

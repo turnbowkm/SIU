@@ -369,6 +369,25 @@ def draw_test_list(doc, df, test):
         y += PRINT_ROW_H
 
 
+def get_next_suffix(df, project, site, sample_date):
+    if df.empty or not project or not site or not sample_date:
+        return 1
+    date_str = sample_date.strftime('%Y%m%d')
+    prefix = f"{project}-{site}-{date_str}-"
+    matching = df[df["SampleID"].astype(str).str.startswith(prefix)]
+    if matching.empty:
+        return 1
+    max_s = 0
+    for sid in matching["SampleID"].dropna().astype(str):
+        try:
+            s_val = int(sid.split("-")[-1])
+            if s_val > max_s:
+                max_s = s_val
+        except ValueError:
+            pass
+    return max_s + 1
+
+
 SCAN_KEYS = "['Enter','Tab']" if SCAN_ACCEPT_TAB else "['Enter']"
 
 app_ui = ui.page_sidebar(
@@ -466,6 +485,19 @@ def server(input, output, session):
         raw_values = config_df.loc[config_df["Project"] == project, "Site"].dropna().tolist()
         sites = sorted({s.strip() for v in raw_values for s in str(v).split(",") if s.strip()})
         return ui.input_select("site", "Site:", choices=sites)
+
+    @reactive.Effect
+    def _():
+        proj = input.project()
+        try:
+            site = input.site()
+        except Exception:
+            site = None
+        sdate = input.sample_date()
+        df = samples.get()
+        if proj and site and sdate:
+            next_s = get_next_suffix(df, proj, site, sdate)
+            ui.update_numeric("start_suffix", value=next_s)
 
     @reactive.Effect
     @reactive.event(input.add_samples)
@@ -645,7 +677,8 @@ def server(input, output, session):
         save_samples(df)
         ui.modal_remove()
         ui.notification_show(f"{int(m.sum())} {test} marked complete.", duration=3)
-        
+    # -------------------------------------------
+
     @render.ui
     def incomplete_chart():
         groups = incomplete_summary(samples.get())

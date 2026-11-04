@@ -2,15 +2,15 @@ import csv
 import pymupdf
 
 # ---------------- CONFIG ----------------
-SITES_CSV     = "sites.csv"   # site code -> site name
-SITE_CODE_COL = "site_code"   # key column in both CSVs
+SITES_TESTS_CSV = "sites_tests.csv"   # one row per project+site, one column per test
+PROJECT_COL   = "Project"             # key column (with site code)
+SITE_CODE_COL = "site_code"
 SITE_NAME_COL = "site_name"
-TESTS_CSV     = "tests.csv"   # one row per site, one column per test
 TRUE_VALUES   = {"x", "y", "yes", "1", "true", "t"}  # cell values that mean "required"
 TITLE         = "Water Sample Sheet"
 
 FIELD_PARAMS = ["Water Temp (C)", "DO (mg/L)", "pH (SU)", "Sp. Cond. (uS/cm)", "Turbidity (NTU)"]
-TESTS = [  # (code, analyte group, container/preservative); TESTS_CSV headers match code or name
+TESTS = [  # (code, analyte group, container/preservative); CSV headers match code or name
     ("NUT",   "Nutrients",          "250 mL, H2SO4, 4C"),
     ("MET",   "Total Metals",       "250 mL, HNO3"),
     ("DMET",  "Dissolved Metals",   "250 mL, filtered, HNO3"),
@@ -47,24 +47,26 @@ STYLES = {
 }
 
 
-def read_tests(path):
-    """site code -> set of required test codes."""
+def read_sites_tests(path):
+    """(project, site code) -> site name, and (project, site code) -> set of required test codes."""
     lookup = {}
     for code, name in ((t[0], t[1]) for t in TESTS):
         lookup[code.upper()] = code.upper()
         lookup[name.upper()] = code.upper()
-    required = {}
+    meta = (PROJECT_COL, SITE_CODE_COL, SITE_NAME_COL)
+    names, required = {}, {}
     with open(path, newline="", encoding="utf-8-sig") as f:
         rd = csv.DictReader(f)
-        cols = {h: lookup.get(h.strip().upper()) for h in rd.fieldnames if h != SITE_CODE_COL}
+        cols = {h: lookup.get(h.strip().upper()) for h in rd.fieldnames if h not in meta}
         for h, c in cols.items():
             if c is None:
                 print(f"warning: tests column '{h}' matches no test, ignored")
         for r in rd:
-            key = r[SITE_CODE_COL].strip()
+            key = (r[PROJECT_COL].strip(), r[SITE_CODE_COL].strip())
+            names[key] = r[SITE_NAME_COL].strip()
             required[key] = {c for h, c in cols.items()
                              if c and (r.get(h) or "").strip().lower() in TRUE_VALUES}
-    return required
+    return names, required
 
 
 def cell(pg, x, y, w, h, text, style):
@@ -119,21 +121,18 @@ def row_(pg, y, h, cells):
 
 
 def load_lookups():
-    """Call once per download: (site code -> name, site code -> set of required test codes)."""
-    with open(SITES_CSV, newline="", encoding="utf-8-sig") as f:
-        names = {r[SITE_CODE_COL].strip(): r[SITE_NAME_COL].strip() for r in csv.DictReader(f)}
-    return names, read_tests(TESTS_CSV)
+    """Call once per download: ((project, site) -> name, (project, site) -> set of required test codes)."""
+    return read_sites_tests(SITES_TESTS_CSV)
 
 
 def draw_sample_sheet(doc, row, lookups):
-    """Append one grid sample sheet for a samples_data row (needs Site, SampleID, SampleDate)."""
+    """Append one grid sample sheet for a samples_data row (needs Project, Site, SampleID, SampleDate)."""
     names, required = lookups
     code = str(row["Site"]).strip()
-    if code not in names:
-        print(f"warning: site {code} not in {SITES_CSV}")
-    if code not in required:
-        print(f"warning: site {code} not in {TESTS_CSV}, no tests pre-checked")
-    name, tests = names.get(code, ""), required.get(code, set())
+    key = (str(row["Project"]).strip(), code)
+    if key not in names:
+        print(f"warning: {key[0]} / {code} not in {SITES_TESTS_CSV}, no tests pre-checked")
+    name, tests = names.get(key, ""), required.get(key, set())
     d = row["SampleDate"]
     date_str = "" if d is None or d != d else str(d)
 

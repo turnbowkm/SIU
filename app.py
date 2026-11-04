@@ -18,7 +18,9 @@ except ImportError as e:
     HAVE_SHEETS = False
 
 # ---------------- CONFIG ----------------
-CONFIG_FILE = "config.csv"
+CONFIG_FILE = "config.csv"                # User, Project
+SITES_TESTS_FILE = "sites_tests.csv"      # Project, site_code, site_name, then one column per test (any non-blank = test applies)
+SITE_META_COLS = ("Project", "site_code", "site_name")
 DATA_FILE = "samples_data.csv"
 BACKUP_FILE = "samples_data.csv.bak"
 CORRUPT_FILE = "samples_data.csv.corrupt"
@@ -68,6 +70,10 @@ PRINT_DONE_LABEL = "Complete"             # text shown in a test cell once that 
 # ----------------------------------------
 
 config_df = pd.read_csv(CONFIG_FILE)
+st_df = pd.read_csv(SITES_TESTS_FILE, dtype=str).fillna("")
+for _c in ("Project", "site_code"):
+    st_df[_c] = st_df[_c].str.strip()
+TEST_COLUMNS = [c for c in st_df.columns if c not in SITE_META_COLS]
 _last_preview_path = None  # module-level, not reactive.Value
 
 
@@ -115,11 +121,16 @@ def save_samples(df):
     os.replace(tmp_path, DATA_FILE)
 
 
+def _tests_for(rows):
+    return [t for t in TEST_COLUMNS if (rows[t].str.strip() != "").any()]
+
+
 def get_project_tests(project):
-    matches = config_df.loc[config_df["Project"] == project, "DefaultTests"]
-    if matches.empty:
-        return []
-    return [t.strip() for t in matches.values[0].split(",")]
+    return _tests_for(st_df.loc[st_df["Project"] == project])
+
+
+def get_site_tests(project, site):
+    return _tests_for(st_df.loc[(st_df["Project"] == project) & (st_df["site_code"] == site)])
 
 
 def _norm(v):
@@ -215,7 +226,7 @@ def draw_label_page(doc, row):
         pymupdf.Rect(x0, QR_MARGIN, x0 + side, QR_MARGIN + side),
         stream=make_qr_png(str(row["SampleID"])), keep_proportion=True)
 
-    project_tests = get_project_tests(row["Project"]) or [row["TestType"]]
+    project_tests = get_site_tests(row["Project"], row["Site"]) or [row["TestType"]]
     max_tests = TEST_COLS * ((LABEL_HEIGHT - TEXT_TESTS_TOP - BOTTOM_MARGIN) // ROW_HEIGHT)
     if len(project_tests) > max_tests:
         print(f"WARNING: {len(project_tests)} tests but only {max_tests} fit on the label")
@@ -242,13 +253,7 @@ def draw_label_page(doc, row):
 
 
 def all_config_tests():
-    seen = []
-    for v in config_df["DefaultTests"].dropna():
-        for t in str(v).split(","):
-            t = t.strip()
-            if t and t not in seen:
-                seen.append(t)
-    return seen
+    return [t for t in TEST_COLUMNS if (st_df[t].str.strip() != "").any()]
 
 
 def incomplete_rows(df):
@@ -481,10 +486,9 @@ def server(input, output, session):
 
     @render.ui
     def site_selector():
-        project = input.project()
-        raw_values = config_df.loc[config_df["Project"] == project, "Site"].dropna().tolist()
-        sites = sorted({s.strip() for v in raw_values for s in str(v).split(",") if s.strip()})
-        return ui.input_select("site", "Site:", choices=sites)
+        sub = st_df.loc[st_df["Project"] == input.project()].drop_duplicates("site_code").sort_values("site_code")
+        choices = {r.site_code: f"{r.site_code} - {r.site_name}" for r in sub.itertuples()}
+        return ui.input_select("site", "Site:", choices=choices)
 
     @reactive.Effect
     def _():
@@ -502,9 +506,10 @@ def server(input, output, session):
     @reactive.Effect
     @reactive.event(input.add_samples)
     def _():
-        project_data = config_df.loc[config_df["Project"] == input.project()]
-        if project_data.empty: return
-        test_list = [t.strip() for t in project_data.iloc[0]["DefaultTests"].split(",")]
+        test_list = get_site_tests(input.project(), input.site())
+        if not test_list:
+            ui.notification_show("No tests configured for this site.", type="warning")
+            return
 
         new_data = []
         for i in range(input.count()):

@@ -5,6 +5,10 @@ import pymupdf
 import tempfile
 import os
 import math
+import sqlite3
+import threading
+import time
+from contextlib import closing
 import io
 import smtplib
 from email.message import EmailMessage
@@ -21,9 +25,15 @@ except ImportError as e:
 CONFIG_FILE = "config.csv"                # User, Project
 SITES_TESTS_FILE = "sites_tests.csv"      # Project, site_code, site_name, then one column per test (any non-blank = test applies)
 SITE_META_COLS = ("Project", "site_code", "site_name")
-DATA_FILE = "samples_data.csv"
-BACKUP_FILE = "samples_data.csv.bak"
-CORRUPT_FILE = "samples_data.csv.corrupt"
+DATA_FILE = "samples_data.csv"            # legacy CSV, imported once if samples.db is empty
+DB_FILE = "samples.db"
+DB_BACKUP = "samples.db.bak"              # refreshed at every app start
+EXPORT_FILE = "samples_export.csv"        # Excel-friendly copy of the whole database, rewritten in the background
+EXPORT_DELAY = 2                          # s, wait after a change so bursts become one export
+EXPORT_RETRY = 30                         # s, retry interval if the file is locked (e.g. open in Excel)
+TABLE_DEFAULT_VIEW = "recent"             # records table: "incomplete", "recent" or "all"
+TABLE_RECENT_DAYS = 30                    # window for the "recent" view
+TABLE_MAX_ROWS = 2000                     # newest N matching rows are sent to the browser
 DATA_COLUMNS = ["SampleID", "User", "Project", "Site", "SampleDate", "TestDate", "TestType",
                 "CompletedDate", "CompletedBy", "Comment"]
 DATE_COLUMNS = ("SampleDate", "TestDate", "CompletedDate")
@@ -44,12 +54,12 @@ RELEASE_CODE = "RELEASE"                  # scan this code to release the active
 
 LABEL_WIDTH = 216                         # 3 in, in pt
 LABEL_HEIGHT = 72                         # 1 in, in pt
-ROW_HEIGHT = 13                           # test checkbox rows on the text label
+ROW_HEIGHT = 10                           # test checkbox rows beside the QR
 BOTTOM_MARGIN = 4
-BOX_SIZE = 11
-TEST_COLS = 3
-TEST_FONT = 8
-TEXT_TESTS_TOP = 32                       # pt, where checkbox rows start on the text label
+BOX_SIZE = 8
+TEST_COLS = 2
+TEST_FONT = 7
+TEXT_TESTS_TOP = 28                       # pt, where checkbox rows start
 QR_MARGIN = 4                             # pt, around the QR on the QR label
 QR_BOX_SIZE = 10                          # px per module in the PNG
 QR_BORDER = 2                             # modules of quiet zone
@@ -88,37 +98,111 @@ def _prep(df):
     return df[DATA_COLUMNS]
 
 
+def _db():
+    con = sqlite3.connect(DB_FILE, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
+
+
+def _to_db(v):
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return None
+    return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+
+def _coerce(col, v):
+    """Cell-edit text -> value for memory/DB (blank -> None, date columns -> date or None)."""
+    v = "" if v is None else str(v).strip()
+    if not v:
+        return None
+    if col in DATE_COLUMNS:
+        d = pd.to_datetime(v, errors="coerce")
+        return None if pd.isna(d) else d.date()
+    return v
+
+
+def insert_samples(df):
+    df = _prep(df.copy())
+    rows = [tuple(_to_db(v) for v in r) for r in df[DATA_COLUMNS].itertuples(index=False, name=None)]
+    q = f"INSERT INTO samples ({', '.join(DATA_COLUMNS)}) VALUES ({', '.join('?' * len(DATA_COLUMNS))})"
+    with closing(_db()) as con, con:
+        con.executemany(q, rows)
+    request_export()
+
+
+def update_samples(ids, **fields):
+    """Set columns on the given row ids (the DataFrame index is the DB id)."""
+    ids = [int(i) for i in ids]
+    if not ids:
+        return
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    vals = [_to_db(v) for v in fields.values()]
+    with closing(_db()) as con, con:
+        con.executemany(f"UPDATE samples SET {sets} WHERE id = ?", [(*vals, i) for i in ids])
+    request_export()
+
+
 def load_samples():
-    if os.path.exists(DATA_FILE):
+    with closing(_db()) as con:
+        df = pd.read_sql_query("SELECT * FROM samples ORDER BY id", con, index_col="id")
+    return _prep(df)
+
+
+def export_csv_bytes():
+    """Whole database as CSV (UTF-8 with BOM so Excel opens it cleanly)."""
+    with closing(_db()) as con:
+        df = pd.read_sql_query(f"SELECT {', '.join(DATA_COLUMNS)} FROM samples ORDER BY id", con)
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+_export_wanted = threading.Event()
+
+
+def request_export():
+    _export_wanted.set()
+
+
+def _export_worker():
+    while True:
+        _export_wanted.wait()
+        time.sleep(EXPORT_DELAY)
+        _export_wanted.clear()
         try:
-            return _prep(pd.read_csv(DATA_FILE))
-        except Exception:
-            try:
-                os.replace(DATA_FILE, CORRUPT_FILE)
-            except OSError:
-                pass
+            tmp = EXPORT_FILE + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(export_csv_bytes())
+            os.replace(tmp, EXPORT_FILE)
+        except Exception as e:
+            print(f"WARNING: could not write {EXPORT_FILE} (open in Excel?), retrying in {EXPORT_RETRY}s: {e}")
+            time.sleep(EXPORT_RETRY)
+            _export_wanted.set()
 
-    if os.path.exists(BACKUP_FILE):
+
+threading.Thread(target=_export_worker, daemon=True).start()
+
+
+def init_db():
+    cols = ", ".join(f"{c} TEXT" for c in DATA_COLUMNS)
+    with closing(_db()) as con, con:
+        con.execute(f"CREATE TABLE IF NOT EXISTS samples (id INTEGER PRIMARY KEY AUTOINCREMENT, {cols})")
+        con.execute("CREATE INDEX IF NOT EXISTS ix_samples_sampleid ON samples (SampleID)")
+        n = con.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    if n == 0 and os.path.exists(DATA_FILE):
         try:
-            return _prep(pd.read_csv(BACKUP_FILE))
-        except Exception:
-            pass
-    return _prep(pd.DataFrame(columns=DATA_COLUMNS))
+            insert_samples(pd.read_csv(DATA_FILE))
+            print(f"Imported {DATA_FILE} into {DB_FILE}")
+        except Exception as e:
+            print(f"WARNING: could not import {DATA_FILE}: {e}")
 
 
-def save_samples(df):
-    tmp_path = DATA_FILE + ".tmp"
-    df.to_csv(tmp_path, index=False)
-    with open(tmp_path, "rb+") as f:
-        f.flush()
-        os.fsync(f.fileno())
+def backup_db():
+    with closing(_db()) as src, closing(sqlite3.connect(DB_BACKUP)) as dst:
+        src.backup(dst)
 
-    if os.path.exists(DATA_FILE):
-        try:
-            os.replace(DATA_FILE, BACKUP_FILE)
-        except OSError:
-            pass
-    os.replace(tmp_path, DATA_FILE)
+
+init_db()
+backup_db()
+request_export()
 
 
 def _tests_for(rows):
@@ -217,13 +301,18 @@ def make_qr_png(text):
     return buf.getvalue()
 
 
+def _fit(text, fontsize, max_w, min_size=5):
+    while fontsize > min_size and pymupdf.get_text_length(text, fontname="helv", fontsize=fontsize) > max_w:
+        fontsize -= 0.5
+    return fontsize
+
+
 def draw_label_page(doc, row):
-    """Two 3x1 in labels per sample: page 1 = QR only, page 2 = readable text + test boxes."""
-    bpage = doc.new_page(width=LABEL_WIDTH, height=LABEL_HEIGHT)
+    """One 3x1 in label per sample: QR on the left, text + test boxes on the right."""
+    page = doc.new_page(width=LABEL_WIDTH, height=LABEL_HEIGHT)
     side = LABEL_HEIGHT - 2 * QR_MARGIN
-    x0 = (LABEL_WIDTH - side) / 2
-    bpage.insert_image(
-        pymupdf.Rect(x0, QR_MARGIN, x0 + side, QR_MARGIN + side),
+    page.insert_image(
+        pymupdf.Rect(QR_MARGIN, QR_MARGIN, QR_MARGIN + side, QR_MARGIN + side),
         stream=make_qr_png(str(row["SampleID"])), keep_proportion=True)
 
     project_tests = get_site_tests(row["Project"], row["Site"]) or [row["TestType"]]
@@ -231,25 +320,28 @@ def draw_label_page(doc, row):
     if len(project_tests) > max_tests:
         print(f"WARNING: {len(project_tests)} tests but only {max_tests} fit on the label")
 
-    page = doc.new_page(width=LABEL_WIDTH, height=LABEL_HEIGHT)
     shape = page.new_shape()
     shape.draw_rect(pymupdf.Rect(2, 2, LABEL_WIDTH - 2, LABEL_HEIGHT - 2))
 
+    tx = 2 * QR_MARGIN + side                 # left edge of the text area
+    tw = LABEL_WIDTH - 6 - tx
     sample_date_str = str(row["SampleDate"]) if pd.notna(row["SampleDate"]) else ""
-    shape.insert_text((8, 14), f"ID: {row['SampleID']}", fontsize=10)
-    shape.insert_text((8, 26), f"Sample Date: {sample_date_str}", fontsize=9)
+    id_txt, date_txt = f"ID: {row['SampleID']}", f"Sample Date: {sample_date_str}"
+    shape.insert_text((tx, 13), id_txt, fontsize=_fit(id_txt, 10, tw))
+    shape.insert_text((tx, 23), date_txt, fontsize=_fit(date_txt, 8, tw))
 
     col_gap = 6
-    col_width = (LABEL_WIDTH - 16 - col_gap * (TEST_COLS - 1)) / TEST_COLS
+    col_width = (tw - col_gap * (TEST_COLS - 1)) / TEST_COLS
     for i, test in enumerate(project_tests):
-        x = 8 + (i % TEST_COLS) * (col_width + col_gap)
+        x = tx + (i % TEST_COLS) * (col_width + col_gap)
         y = TEXT_TESTS_TOP + (i // TEST_COLS) * ROW_HEIGHT
         shape.draw_rect(pymupdf.Rect(x, y, x + BOX_SIZE, y + BOX_SIZE))
-        shape.insert_text((x + BOX_SIZE + 3, y + BOX_SIZE - 2), test, fontsize=TEST_FONT)
+        shape.insert_text((x + BOX_SIZE + 3, y + BOX_SIZE - 1.5), test,
+                          fontsize=_fit(test, TEST_FONT, col_width - BOX_SIZE - 3))
 
     shape.finish(width=0.5)
     shape.commit()
-    return bpage, page
+    return page
 
 
 def all_config_tests():
@@ -258,6 +350,15 @@ def all_config_tests():
 
 def incomplete_rows(df):
     return df.loc[df["CompletedDate"].map(_blank)]
+
+
+def filter_samples(df, mode):
+    if mode == "incomplete":
+        return incomplete_rows(df)
+    if mode == "recent":
+        sd = pd.to_datetime(df["SampleDate"], errors="coerce")
+        return df.loc[sd >= pd.Timestamp(date.today() - timedelta(days=TABLE_RECENT_DAYS))]
+    return df
 
 
 def incomplete_summary(df):
@@ -399,13 +500,12 @@ app_ui = ui.page_sidebar(
     ui.sidebar(
         ui.input_text("scan", "Scan:", placeholder="Sample or chemical code..."),
         ui.output_text("active_label"),
-        ui.input_action_button("release", "Release Active Sample", class_="btn-outline-secondary w-100"),
+        ui.download_button("download_checked_labels", "Print Labels for Checked Sites", class_="btn-outline-secondary w-100"),
         ui.input_select("user", "User:", choices=sorted(config_df["User"].unique().tolist())),
         ui.input_select("project", "Project:", choices=sorted(config_df["Project"].unique().tolist())),
         ui.output_ui("site_selector"),
         ui.input_date("sample_date", "Sample Date:", value=date.today()),
-        ui.input_date("test_date", "Test Date:", value=None),
-        ui.input_numeric("start_suffix", "Starting Suffix:", value=1),
+        ui.input_numeric("start_suffix", "Starting Suffix (one site only):", value=1),
         ui.input_numeric("count", "Number of Samples:", value=1),
         ui.input_action_button("add_samples", "Add Samples", class_="btn-primary w-100"),
     ),
@@ -439,7 +539,14 @@ $(document).on('shiny:connected', focusScan);
             "Records",
             ui.div(
                 ui.card(
-                    ui.card_header("Test Records"),
+                    ui.card_header(ui.div(
+                        ui.span("Test Records"),
+                        ui.input_select("view_mode", None, width="180px", selected=TABLE_DEFAULT_VIEW,
+                                        choices={"incomplete": "Incomplete only",
+                                                 "recent": f"Last {TABLE_RECENT_DAYS} days",
+                                                 "all": "All rows"}),
+                        ui.output_text("table_note"),
+                        class_="d-flex align-items-center gap-3 flex-wrap")),
                     ui.output_data_frame("sample_table"),
                 ),
                 ui.card(
@@ -484,59 +591,105 @@ def server(input, output, session):
     scanned_id = reactive.Value(None)
     completed_user = reactive.Value(None)
 
+    def _project_sites():
+        sub = st_df.loc[st_df["Project"] == input.project()].drop_duplicates("site_code").sort_values("site_code")
+        return {r.site_code: f"{r.site_code} - {r.site_name}" for r in sub.itertuples()}
+
     @render.ui
     def site_selector():
-        sub = st_df.loc[st_df["Project"] == input.project()].drop_duplicates("site_code").sort_values("site_code")
-        choices = {r.site_code: f"{r.site_code} - {r.site_name}" for r in sub.itertuples()}
-        return ui.input_select("site", "Site:", choices=choices)
+        return ui.div(
+            ui.tags.label("Sites:", class_="form-label"),
+            ui.div(ui.input_action_button("sites_all", "Select all", class_="btn-sm btn-outline-secondary mb-2")),
+            ui.input_checkbox_group("sites", None, choices=_project_sites()),
+            style="max-height:40vh;overflow-y:auto;")
+
+    @reactive.Effect
+    @reactive.event(input.sites_all)
+    def _():
+        keys = list(_project_sites().keys())
+        all_on = bool(keys) and set(input.sites() or []) == set(keys)
+        ui.update_checkbox_group("sites", selected=[] if all_on else keys)
+
+    @reactive.Effect
+    def _():
+        keys = set(_project_sites().keys())
+        all_on = bool(keys) and set(input.sites() or []) == keys
+        ui.update_action_button("sites_all", label="Deselect all" if all_on else "Select all")
 
     @reactive.Effect
     def _():
         proj = input.project()
         try:
-            site = input.site()
+            sites = list(input.sites() or [])
         except Exception:
-            site = None
+            sites = []
         sdate = input.sample_date()
         df = samples.get()
-        if proj and site and sdate:
-            next_s = get_next_suffix(df, proj, site, sdate)
-            ui.update_numeric("start_suffix", value=next_s)
+        if proj and len(sites) == 1 and sdate:
+            ui.update_numeric("start_suffix", value=get_next_suffix(df, proj, sites[0], sdate))
+
+    def _planned_rows(sites):
+        """Sample rows for the checked sites from the sidebar settings. Nothing is saved here."""
+        df = samples.get()
+        out = []
+        for site in sites:
+            test_list = get_site_tests(input.project(), site)
+            if not test_list:
+                ui.notification_show(f"No tests configured for {site}, skipped.", type="warning")
+                continue
+            first = input.start_suffix() if len(sites) == 1 else get_next_suffix(df, input.project(), site, input.sample_date())
+            for i in range(input.count()):
+                sample_id = f"{input.project()}-{site}-{input.sample_date().strftime('%Y%m%d')}-{first + i:03d}"
+                for test in test_list:
+                    out.append({
+                        "SampleID": sample_id, "User": input.user(), "Project": input.project(),
+                        "Site": site, "SampleDate": input.sample_date(),
+                        "TestType": test,
+                    })
+        return out
 
     @reactive.Effect
     @reactive.event(input.add_samples)
     def _():
-        test_list = get_site_tests(input.project(), input.site())
-        if not test_list:
-            ui.notification_show("No tests configured for this site.", type="warning")
+        sites = list(input.sites() or [])
+        if not sites:
+            ui.notification_show("Check at least one site.", type="warning")
             return
+        new_data = _planned_rows(sites)
+        if not new_data:
+            return
+        insert_samples(pd.DataFrame(new_data))
+        samples.set(load_samples())
 
-        new_data = []
-        for i in range(input.count()):
-            suffix = input.start_suffix() + i
-            sample_id = f"{input.project()}-{input.site()}-{input.sample_date().strftime('%Y%m%d')}-{suffix:03d}"
-            for test in test_list:
-                new_data.append({
-                    "SampleID": sample_id, "User": input.user(), "Project": input.project(),
-                    "Site": input.site(), "SampleDate": input.sample_date(),
-                    "TestDate": input.test_date(), "TestType": test,
-                })
-        updated_df = _prep(pd.concat([samples.get(), pd.DataFrame(new_data)], ignore_index=True))
-        samples.set(updated_df)
-        save_samples(updated_df)
+    @reactive.Calc
+    def _filtered():
+        return filter_samples(samples.get(), input.view_mode())
+
+    @reactive.Calc
+    def view_df():
+        return _filtered().tail(TABLE_MAX_ROWS)
+
+    @render.text
+    def table_note():
+        n, total = len(_filtered()), len(samples.get())
+        shown = min(n, TABLE_MAX_ROWS)
+        return f"Showing {shown} of {total} rows" + (f" (newest {TABLE_MAX_ROWS} of {n} matching)" if n > shown else "")
 
     @render.data_frame
     def sample_table():
-        return render.DataGrid(samples.get(), editable=True, selection_mode="rows")
+        return render.DataGrid(view_df(), editable=True, selection_mode="rows", filters=True)
 
     @reactive.Effect
     @reactive.event(input.sample_table_cell_edit)
     def _():
         edit = input.sample_table_cell_edit()
-        df = samples.get()
-        df.iat[edit["row"], edit["col"]] = edit["value"]
-        samples.set(df)
-        save_samples(df)
+        rid = view_df().index[edit["row"]]          # DataFrame index = DB id
+        col = DATA_COLUMNS[edit["col"]]
+        val = _coerce(col, edit["value"])
+        if val is None and col in DATE_COLUMNS and str(edit["value"] or "").strip():
+            ui.notification_show(f"Invalid date in {col}, cleared.", type="warning")
+        samples.get().at[rid, col] = val
+        update_samples([rid], **{col: val})
 
     # ---------- complete-tests window ----------
     def _get_complete_projects(df):
@@ -677,9 +830,10 @@ def server(input, output, session):
         df = samples.get().copy()
         m = df["SampleID"].astype(str).isin(sel) & _pending_mask(df, test, proj)
         df.loc[m, "CompletedDate"] = input.cl_date()
+        df.loc[m, "TestDate"] = input.cl_date()
         df.loc[m, "CompletedBy"] = input.cl_by()
         samples.set(df)
-        save_samples(df)
+        update_samples(df.index[m.to_numpy()], CompletedDate=input.cl_date(), TestDate=input.cl_date(), CompletedBy=input.cl_by())
         ui.modal_remove()
         ui.notification_show(f"{int(m.sum())} {test} marked complete.", duration=3)
     # -------------------------------------------
@@ -805,13 +959,6 @@ def server(input, output, session):
     def _():
         completed_user.set(input.completed_by())
 
-    @reactive.Effect
-    @reactive.event(input.release)
-    def _():
-        scanned_id.set(None)
-        completed_user.set(None)
-        ui.notification_show("Active sample released.", duration=3)
-
     @render.text
     def active_label():
         return f"Active sample: {scanned_id.get()}" if scanned_id.get() else "Active sample: none"
@@ -840,13 +987,16 @@ def server(input, output, session):
         df = samples.get().copy()
         mask = df["SampleID"] == sid
         tmask = mask & df["TestType"].isin(list(input.done_tests() or []))
+        by = input.completed_by() or completed_user.get()
         df.loc[tmask, "CompletedDate"] = date.today()
-        df.loc[tmask, "CompletedBy"] = input.completed_by() or completed_user.get()
+        df.loc[tmask, "TestDate"] = date.today()
+        df.loc[tmask, "CompletedBy"] = by
+        update_samples(df.index[tmask.to_numpy()], CompletedDate=date.today(), TestDate=date.today(), CompletedBy=by)
         comment = (input.scan_comment() or "").strip()
         if comment:
             df.loc[mask, "Comment"] = comment
+            update_samples(df.index[mask.to_numpy()], Comment=comment)
         samples.set(df)
-        save_samples(df)
         ui.modal_remove()
         ui.notification_show(f"Saved {sid}.", duration=3)
 
@@ -868,17 +1018,11 @@ def server(input, output, session):
         selected_indices = input.sample_table_selected_rows()
         if not selected_indices:
             return None
-        row = samples.get().iloc[list(selected_indices)[0]]
+        row = view_df().iloc[list(selected_indices)[0]]
 
         doc = pymupdf.open()
         draw_label_page(doc, row)
-        gap = 6
-        combo = pymupdf.open()
-        cp = combo.new_page(width=LABEL_WIDTH, height=2 * LABEL_HEIGHT + gap)
-        cp.show_pdf_page(pymupdf.Rect(0, 0, LABEL_WIDTH, LABEL_HEIGHT), doc, 0)
-        cp.show_pdf_page(pymupdf.Rect(0, LABEL_HEIGHT + gap, LABEL_WIDTH, 2 * LABEL_HEIGHT + gap), doc, 1)
-        pix = cp.get_pixmap(matrix=pymupdf.Matrix(3, 3))
-        combo.close()
+        pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(3, 3))
 
         if _last_preview_path and os.path.exists(_last_preview_path):
             try:
@@ -899,7 +1043,7 @@ def server(input, output, session):
         selected_indices = input.sample_table_selected_rows()
         if not selected_indices:
             return
-        label_rows = samples.get().iloc[list(selected_indices)]
+        label_rows = view_df().iloc[list(selected_indices)]
 
         doc = pymupdf.open()
         for _, row in label_rows.iterrows():
@@ -910,6 +1054,23 @@ def server(input, output, session):
 
         yield pdf_bytes
 
+    @render.download(filename=lambda: f"{input.project()}_{input.sample_date()}_labels.pdf")
+    def download_checked_labels():
+        sites = list(input.sites() or [])
+        if not sites:
+            return
+        planned = _planned_rows(sites)           # same IDs Add Samples would create; not saved
+        if not planned:
+            return
+        rows = pd.DataFrame(planned).drop_duplicates("SampleID")
+
+        doc = pymupdf.open()
+        for _, row in rows.iterrows():
+            draw_label_page(doc, row)
+        pdf_bytes = doc.tobytes()
+        doc.close()
+        yield pdf_bytes
+
     @render.download(filename="sample_sheets.pdf")
     def download_sheets():
         if not HAVE_SHEETS:
@@ -917,7 +1078,7 @@ def server(input, output, session):
         selected_indices = input.sample_table_selected_rows()
         if not selected_indices:
             return
-        rows = samples.get().iloc[list(selected_indices)].drop_duplicates("SampleID")
+        rows = view_df().iloc[list(selected_indices)].drop_duplicates("SampleID")
         lookups = load_lookups()
 
         doc = pymupdf.open()

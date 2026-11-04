@@ -10,15 +10,18 @@ TRUE_VALUES   = {"x", "y", "yes", "1", "true", "t"}  # cell values that mean "re
 TITLE         = "Water Sample Sheet"
 
 FIELD_PARAMS = ["Water Temp (C)", "DO (mg/L)", "pH (SU)", "Sp. Cond. (uS/cm)", "Turbidity (NTU)"]
-TESTS = [  # (code, analyte group, container/preservative); CSV headers match code or name
-    ("NUT",   "Nutrients",          "250 mL, H2SO4, 4C"),
-    ("MET",   "Total Metals",       "250 mL, HNO3"),
-    ("DMET",  "Dissolved Metals",   "250 mL, filtered, HNO3"),
-    ("CLSO4", "Chloride / Sulfate", "250 mL, 4C"),
-    ("TSS",   "TSS / Solids",       "1 L, 4C"),
-    ("ECOLI", "E. coli",            "100 mL sterile, 4C"),
-    ("CHLA",  "Chlorophyll a",      "filter, frozen"),
-]
+TEST_INFO = {  # optional overrides keyed by CSV column header: (analyte group, container/preservative)
+    "NUT":           ("Nutrients",          "250 mL, H2SO4, 4C"),
+    "MET":           ("Total Metals",       "250 mL, HNO3"),
+    "DMET":          ("Dissolved Metals",   "250 mL, filtered, HNO3"),
+    "CLSO4":         ("Chloride / Sulfate", "250 mL, 4C"),
+    "TSS":           ("TSS / Solids",       "1 L, 4C"),
+    "ECOLI":         ("E. coli",            "100 mL sterile, 4C"),
+    "Chlorophyll a": ("Chlorophyll a",      "filter, frozen"),
+}                       # columns not listed use the header as the analyte group, blank container
+TEST_ROWS_H = 154       # total pt for all test rows; each row shrinks (min TEST_ROW_MIN) to fit
+TEST_ROW_MAX = 22
+TEST_ROW_MIN = 12
 QC_ITEMS = ["Field Blank", "Duplicate", "Equipment Blank", "MS/MSD"]
 
 HDR_FILL = (0.92, 0.92, 0.92)   # set to None for no shading
@@ -48,25 +51,18 @@ STYLES = {
 
 
 def read_sites_tests(path):
-    """(project, site code) -> site name, and (project, site code) -> set of required test codes."""
-    lookup = {}
-    for code, name in ((t[0], t[1]) for t in TESTS):
-        lookup[code.upper()] = code.upper()
-        lookup[name.upper()] = code.upper()
+    """(project, site) -> name, (project, site) -> set of required test headers, ordered test headers."""
     meta = (PROJECT_COL, SITE_CODE_COL, SITE_NAME_COL)
     names, required = {}, {}
     with open(path, newline="", encoding="utf-8-sig") as f:
         rd = csv.DictReader(f)
-        cols = {h: lookup.get(h.strip().upper()) for h in rd.fieldnames if h not in meta}
-        for h, c in cols.items():
-            if c is None:
-                print(f"warning: tests column '{h}' matches no test, ignored")
+        tests = [h for h in rd.fieldnames if h not in meta]
         for r in rd:
             key = (r[PROJECT_COL].strip(), r[SITE_CODE_COL].strip())
             names[key] = r[SITE_NAME_COL].strip()
-            required[key] = {c for h, c in cols.items()
-                             if c and (r.get(h) or "").strip().lower() in TRUE_VALUES}
-    return names, required
+            required.setdefault(key, set()).update(
+                h for h in tests if (r.get(h) or "").strip().lower() in TRUE_VALUES)
+    return names, required, tests
 
 
 def cell(pg, x, y, w, h, text, style):
@@ -121,13 +117,13 @@ def row_(pg, y, h, cells):
 
 
 def load_lookups():
-    """Call once per download: ((project, site) -> name, (project, site) -> set of required test codes)."""
+    """Call once per download: (names, required, tests); see read_sites_tests."""
     return read_sites_tests(SITES_TESTS_CSV)
 
 
 def draw_sample_sheet(doc, row, lookups):
     """Append one grid sample sheet for a samples_data row (needs Project, Site, SampleID, SampleDate)."""
-    names, required = lookups
+    names, required, test_cols = lookups
     code = str(row["Site"]).strip()
     key = (str(row["Project"]).strip(), code)
     if key not in names:
@@ -157,8 +153,10 @@ def draw_sample_sheet(doc, row, lookups):
     y = row_(pg, y, 18, [(5, "Samples", "section")])
     y = row_(pg, y, 20, [(0.6, "Required", "head"), (0.6, "Collected", "head"), (1.1, "Analyte Group", "head"),
                          (1.5, "Container / Preservative", "head"), (1.2, "Bottle ID / Notes", "head")])
-    for tcode, grp, cont in TESTS:
-        y = row_(pg, y, 22, [(0.6, "X" if tcode.upper() in tests else "", "cbox"), (0.6, "", "cbox"),
+    th = max(TEST_ROW_MIN, min(TEST_ROW_MAX, TEST_ROWS_H / max(len(test_cols), 1)))
+    for t in test_cols:
+        grp, cont = TEST_INFO.get(t, (t, ""))
+        y = row_(pg, y, th, [(0.6, "X" if t in tests else "", "cbox"), (0.6, "", "cbox"),
                              (1.1, grp, "label"), (1.5, cont, "label"), (1.2, "", "blank")])
     q = 4 / len(QC_ITEMS)
     y = row_(pg, y, ROW_H, [(1, "QC Samples", "label")] + [(q, t, "qc") for t in QC_ITEMS])

@@ -65,6 +65,7 @@ QR_BOX_SIZE = 10                          # px per module in the PNG
 QR_BORDER = 2                             # modules of quiet zone
 QR_ERROR = qrcode.constants.ERROR_CORRECT_M   # L, M, Q or H
 SCAN_ACCEPT_TAB = False                   # True if scanner sends Tab instead of Enter
+SCAN_ADDS_SAMPLES = True                  # scanning a valid label whose sample isn't in the database adds it
 
 PRINT_PAGE_W = 792                        # letter landscape, pt
 PRINT_PAGE_H = 612
@@ -475,23 +476,29 @@ def draw_test_list(doc, df, test):
         y += PRINT_ROW_H
 
 
-def get_next_suffix(df, project, site, sample_date):
-    if df.empty or not project or not site or not sample_date:
+def parse_sample_id(code):
+    """'Project-Site-YYYYMMDD-NNN' -> (project, site, date, suffix) if it matches a configured project/site, else None."""
+    parts = str(code).strip().rsplit("-", 2)
+    if len(parts) != 3 or not parts[2].isdigit():
+        return None
+    head, ds, suffix = parts
+    try:
+        d = datetime.strptime(ds, "%Y%m%d").date()
+    except ValueError:
+        return None
+    for r in st_df[["Project", "site_code"]].drop_duplicates().itertuples(index=False):
+        if f"{r.Project}-{r.site_code}".upper() == head.upper():
+            return r.Project, r.site_code, d, suffix
+    return None
+
+
+def get_next_suffix(df, project):
+    """Next sample number for the project, continuing across all sites and dates."""
+    if df.empty or not project:
         return 1
-    date_str = sample_date.strftime('%Y%m%d')
-    prefix = f"{project}-{site}-{date_str}-"
-    matching = df[df["SampleID"].astype(str).str.startswith(prefix)]
-    if matching.empty:
-        return 1
-    max_s = 0
-    for sid in matching["SampleID"].dropna().astype(str):
-        try:
-            s_val = int(sid.split("-")[-1])
-            if s_val > max_s:
-                max_s = s_val
-        except ValueError:
-            pass
-    return max_s + 1
+    ids = df.loc[df["Project"] == project, "SampleID"].dropna().astype(str)
+    nums = pd.to_numeric(ids.str.rsplit("-", n=1).str[-1], errors="coerce")
+    return int(nums.max()) + 1 if nums.notna().any() else 1
 
 
 SCAN_KEYS = "['Enter','Tab']" if SCAN_ACCEPT_TAB else "['Enter']"
@@ -505,7 +512,7 @@ app_ui = ui.page_sidebar(
         ui.input_select("project", "Project:", choices=sorted(config_df["Project"].unique().tolist())),
         ui.output_ui("site_selector"),
         ui.input_date("sample_date", "Sample Date:", value=date.today()),
-        ui.input_numeric("start_suffix", "Starting Suffix (one site only):", value=1),
+        ui.input_numeric("start_suffix", "Starting Suffix:", value=1),
         ui.input_numeric("count", "Number of Samples:", value=1),
         ui.input_action_button("add_samples", "Add Samples", class_="btn-primary w-100"),
     ),
@@ -619,27 +626,21 @@ def server(input, output, session):
     @reactive.Effect
     def _():
         proj = input.project()
-        try:
-            sites = list(input.sites() or [])
-        except Exception:
-            sites = []
-        sdate = input.sample_date()
-        df = samples.get()
-        if proj and len(sites) == 1 and sdate:
-            ui.update_numeric("start_suffix", value=get_next_suffix(df, proj, sites[0], sdate))
+        if proj:
+            ui.update_numeric("start_suffix", value=get_next_suffix(samples.get(), proj))
 
     def _planned_rows(sites):
         """Sample rows for the checked sites from the sidebar settings. Nothing is saved here."""
-        df = samples.get()
+        n = input.start_suffix()
         out = []
         for site in sites:
             test_list = get_site_tests(input.project(), site)
             if not test_list:
                 ui.notification_show(f"No tests configured for {site}, skipped.", type="warning")
                 continue
-            first = input.start_suffix() if len(sites) == 1 else get_next_suffix(df, input.project(), site, input.sample_date())
-            for i in range(input.count()):
-                sample_id = f"{input.project()}-{site}-{input.sample_date().strftime('%Y%m%d')}-{first + i:03d}"
+            for _ in range(input.count()):
+                sample_id = f"{input.project()}-{site}-{input.sample_date().strftime('%Y%m%d')}-{n:03d}"
+                n += 1
                 for test in test_list:
                     out.append({
                         "SampleID": sample_id, "User": input.user(), "Project": input.project(),
@@ -930,6 +931,20 @@ def server(input, output, session):
             return
 
         rows = samples.get().loc[lambda d: d["SampleID"].astype(str).str.upper() == code.upper()]
+        if rows.empty and SCAN_ADDS_SAMPLES:
+            samples.set(load_samples())          # may have been added from another session
+            rows = samples.get().loc[lambda d: d["SampleID"].astype(str).str.upper() == code.upper()]
+            parsed = parse_sample_id(code)
+            tests = get_site_tests(parsed[0], parsed[1]) if parsed and rows.empty else []
+            if tests:
+                proj, site, sdate, suffix = parsed
+                sid = f"{proj}-{site}-{sdate:%Y%m%d}-{suffix}"
+                insert_samples(pd.DataFrame([{
+                    "SampleID": sid, "User": input.user(), "Project": proj, "Site": site,
+                    "SampleDate": sdate, "TestType": t} for t in tests]))
+                samples.set(load_samples())
+                rows = samples.get().loc[lambda d: d["SampleID"] == sid]
+                ui.notification_show(f"Added {sid} to the database.", duration=4)
         if rows.empty:
             ui.notification_show(f"Unknown code: {code}", type="warning")
             return

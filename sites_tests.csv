@@ -1,4 +1,4 @@
-Project,site_code,site_name,Filter,pH,Dis. P,NO4,TSS,NH4,Total P,Cond.,IC,TN,POC
+Project,site_code,site_name,Filter,pH,DRP,NO3,TSS,NH4,Total P,Cond.,IC,TN,POC
 Wascob1,W1-04,,X,,,,X,,,,,,
 Wascob2,W2-12,,X,X,X,X,,,,,,,
 Wascob3,W3-01,,1,,,,,,,,,,

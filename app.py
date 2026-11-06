@@ -508,7 +508,7 @@ app_ui = ui.page_sidebar(
     ui.sidebar(
         ui.input_text("scan", "Scan:", placeholder="Sample or chemical code..."),
         ui.output_text("active_label"),
-        ui.download_button("download_checked_labels", "Print Labels for Checked Sites", class_="btn-outline-secondary w-100"),
+        ui.download_button("download_checked_labels", "Print Labels for Checked Sites", class_="btn-success w-100"),
         ui.input_select("user", "User:", choices=sorted(config_df["User"].unique().tolist())),
         ui.input_select("project", "Project:", choices=sorted(config_df["Project"].unique().tolist())),
         ui.output_ui("site_selector"),

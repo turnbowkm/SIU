@@ -1,8 +1,8 @@
 Project,site_code,site_name,Filter,pH,DRP,NO3,TSS,NH4,Total P,Cond.,IC,TN,POC
 Wascob1,W1-04,,X,,,,X,,,,,,
 Wascob2,W2-12,,X,X,X,X,,,,,,,
-Wascob3,W3-01,,1,,,,,,,,,,
-Streambank,STB-01,,,,,,,,,,,,
+Wascob3,W3-01,,X,,,,,,,,,,
+Streambank,STB-01,X,,,,,,,,,,,
 Wheat,P101,Pan,X,X,X,X,X,X,X,X,X,X,X
 Wheat,P102,Pan,X,X,X,X,X,X,X,X,X,X,X
 Wheat,P103,Pan,X,X,X,X,X,X,X,X,X,X,X

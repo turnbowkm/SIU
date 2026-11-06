@@ -625,7 +625,7 @@ def server(input, output, session):
                                   class_="btn btn-success w-100")
         return ui.download_button(
             "download_checked_labels",
-            f"Print {n} label{'s' if n != 1 else ''}",
+            f"Print {n} {input.project()} label{'s' if n != 1 else ''}",
             class_="btn-success w-100")
 
     @reactive.Effect

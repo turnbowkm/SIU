@@ -508,7 +508,7 @@ app_ui = ui.page_sidebar(
     ui.sidebar(
         ui.input_text("scan", "Scan:", placeholder="Sample or chemical code..."),
         ui.output_text("active_label"),
-        ui.download_button("download_checked_labels", "Print Labels for Checked Sites", class_="btn-success w-100"),
+        ui.output_ui("print_button"),
         ui.input_select("user", "User:", choices=sorted(config_df["User"].unique().tolist())),
         ui.input_select("project", "Project:", choices=sorted(config_df["Project"].unique().tolist())),
         ui.output_ui("site_selector"),
@@ -610,6 +610,24 @@ def server(input, output, session):
             ui.div(ui.input_action_button("sites_all", "Select all", class_="btn-sm btn-outline-secondary mb-2")),
             ui.input_checkbox_group("sites", None, choices=_project_sites()),
             style="max-height:40vh;overflow-y:auto;")
+
+    @render.ui
+    def print_button():
+        try:
+            sites = [x for x in (input.sites() or []) if get_site_tests(input.project(), x)]
+        except Exception:
+            sites = []
+        cnt = int(input.count() or 0)
+        n = len(sites) * cnt
+        if n == 0:
+            return ui.tags.button("Print Labels: check sites first", type="button", disabled=True,
+                                  class_="btn btn-success w-100")
+        first = int(input.start_suffix() or 1)
+        nums = f"#{first:03d}" if n == 1 else f"#{first:03d}-#{first + n - 1:03d}"
+        return ui.download_button(
+            "download_checked_labels",
+            f"Print {n} label{'s' if n != 1 else ''} ({len(sites)} site{'s' if len(sites) != 1 else ''} x {cnt}, {nums})",
+            class_="btn-success w-100")
 
     @reactive.Effect
     @reactive.event(input.sites_all)

@@ -34,6 +34,7 @@ EXPORT_RETRY = 30                         # s, retry interval if the file is loc
 TABLE_DEFAULT_VIEW = "recent"             # records table: "incomplete", "recent" or "all"
 TABLE_RECENT_DAYS = 30                    # window for the "recent" view
 TABLE_MAX_ROWS = 2000                     # newest N matching rows are sent to the browser
+PENDING_CSV_COLUMNS = ["SampleID"]        # columns in the Complete Tests window CSV (e.g. add "Site", "SampleDate")
 DATA_COLUMNS = ["SampleID", "User", "Project", "Site", "SampleDate", "TestDate", "TestType",
                 "CompletedDate", "CompletedBy", "Comment"]
 DATE_COLUMNS = ("SampleDate", "TestDate", "CompletedDate")
@@ -740,8 +741,8 @@ def server(input, output, session):
             ),
             ui.div(
                 ui.input_action_button("cl_all", "Select all", class_="btn-sm btn-outline-secondary"),
-                ui.download_button("cl_print", "Print list", class_="btn-sm btn-outline-primary"),
-                class_="d-flex gap-2 mb-2",
+                ui.output_ui("cl_buttons"),
+                class_="d-flex gap-2 mb-2 flex-wrap",
             ),
             ui.output_ui("cl_list"),
             ui.input_date("cl_date", "Completed date:", value=date.today()),
@@ -807,6 +808,26 @@ def server(input, output, session):
         proj = input.cl_project() if "cl_project" in input else "(All)"
         ui.update_action_button("cl_all", label="Select all")
         ui.update_checkbox_group("cl_sel", selected=list(_pending_choices(test, proj).keys()))
+
+    @render.ui
+    def cl_buttons():
+        test = input.cl_test()
+        proj = input.cl_project() if "cl_project" in input else "(All)"
+        n = int(_pending_mask(samples.get(), test, proj).sum())
+        what = f"{n} pending {test} ({'all projects' if proj == '(All)' else proj})"
+        return ui.div(
+            ui.download_button("cl_print", f"Print list: {what}", class_="btn-sm btn-outline-primary"),
+            ui.download_button("cl_csv", f"CSV of sample IDs: {what}", class_="btn-sm btn-outline-primary"),
+            class_="d-flex gap-2 flex-wrap")
+
+    @render.download(filename=lambda: f"{input.cl_project()}_{input.cl_test()}_pending.csv")
+    def cl_csv():
+        test = input.cl_test()
+        proj = input.cl_project() if "cl_project" in input else "(All)"
+        df = samples.get()
+        sub = df.loc[_pending_mask(df, test, proj)]
+        sub = sub.assign(_d=sub["SampleDate"].astype(str)).sort_values(["_d", "SampleID"])
+        yield sub[PENDING_CSV_COLUMNS].drop_duplicates().to_csv(index=False).encode("utf-8-sig")
 
     @render.download(filename=lambda: f"{input.cl_project()}_{input.cl_test()}_pending.pdf")
     def cl_print():

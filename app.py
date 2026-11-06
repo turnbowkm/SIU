@@ -605,10 +605,11 @@ def server(input, output, session):
 
     @render.ui
     def site_selector():
+        choices = _project_sites()
         return ui.div(
             ui.tags.label("Sites:", class_="form-label"),
             ui.div(ui.input_action_button("sites_all", "Select all", class_="btn-sm btn-outline-secondary mb-2")),
-            ui.input_checkbox_group("sites", None, choices=_project_sites()),
+            ui.input_checkbox_group("sites", None, choices=choices, selected=list(choices)),
             style="max-height:40vh;overflow-y:auto;")
 
     @render.ui

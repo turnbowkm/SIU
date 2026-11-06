@@ -699,9 +699,17 @@ def server(input, output, session):
         projs = sorted(set(inc["Project"].dropna().astype(str)) | set(config_df["Project"].dropna().astype(str)))
         return ["(All)"] + projs
 
-    def _pending_mask(df, test, project=None):
+    def _mode():
+        return input.cl_mode() if "cl_mode" in input else "complete"
+
+    def _open_rows(df, mode=None):
+        """Rows the window works on: pending ones to mark complete, completed ones to mark incomplete."""
+        return incomplete_rows(df) if (mode or _mode()) == "complete" else df.loc[~df["CompletedDate"].map(_blank)]
+
+    def _pending_mask(df, test, project=None, mode=None):
+        done = df["CompletedDate"].map(_blank)
         m = (df["TestType"].astype(str).str.strip().str.upper() == str(test).strip().upper()) \
-            & df["CompletedDate"].map(_blank)
+            & (done if (mode or _mode()) == "complete" else ~done)
         if project and project != "(All)":
             m = m & (df["Project"].astype(str) == str(project))
         return m
@@ -709,7 +717,12 @@ def server(input, output, session):
     def _pending_choices(test, project=None):
         df = samples.get()
         pend = df.loc[_pending_mask(df, test, project)].sort_values(["SampleDate", "SampleID"])
-        return {str(r.SampleID): f"{r.SampleID}  ({r.SampleDate})" for r in pend.itertuples()}
+        undo = _mode() == "undo"
+        return {str(r.SampleID): f"{r.SampleID}  ({r.SampleDate})" + (f"  completed {r.CompletedDate}" if undo else "")
+                for r in pend.itertuples()}
+
+    def _default_sel(test, project):
+        return [] if _mode() == "undo" else list(_pending_choices(test, project).keys())
 
     @reactive.Effect
     @reactive.event(input.cl_open)
@@ -724,11 +737,13 @@ def server(input, output, session):
         if not tests:
             ui.notification_show("No tests configured.", duration=3)
             return
-        counts = {t: int(_pending_mask(df, t).sum()) for t in tests}
+        counts = {t: int(_pending_mask(df, t, mode="complete").sum()) for t in tests}
         first = max(tests, key=lambda t: counts[t])
         users = sorted(set(config_df["User"].unique().tolist()) | {input.user()})
         
         ui.modal_show(ui.modal(
+            ui.input_radio_buttons("cl_mode", None, selected="complete", inline=True,
+                                   choices={"complete": "Mark complete", "undo": "Mark incomplete (undo)"}),
             ui.div(
                 ui.tags.label("Project:", class_="form-label fw-bold small text-muted mb-1"),
                 ui.input_radio_buttons("cl_project", None, choices=projects, selected=default_proj, inline=True),
@@ -745,8 +760,11 @@ def server(input, output, session):
                 class_="d-flex gap-2 mb-2 flex-wrap",
             ),
             ui.output_ui("cl_list"),
-            ui.input_date("cl_date", "Completed date:", value=date.today()),
-            ui.input_select("cl_by", "Completed by:", choices=users, selected=input.user()),
+            ui.panel_conditional(
+                "input.cl_mode == 'complete'",
+                ui.input_date("cl_date", "Completed date:", value=date.today()),
+                ui.input_select("cl_by", "Completed by:", choices=users, selected=input.user()),
+            ),
             title="Complete tests",
             footer=ui.TagList(ui.modal_button("Cancel"),
                               ui.input_action_button("cl_save", "Save", class_="btn-primary")),
@@ -754,11 +772,11 @@ def server(input, output, session):
         ))
 
     @reactive.Effect
-    @reactive.event(input.cl_project)
+    @reactive.event(input.cl_project, input.cl_mode)
     def _():
         proj = input.cl_project()
         df = samples.get()
-        inc = incomplete_rows(df)
+        inc = _open_rows(df)
         if proj and proj != "(All)":
             cfg = get_project_tests(proj)
             tests = cfg + sorted(set(inc.loc[inc["Project"].astype(str) == proj, "TestType"].dropna().astype(str).str.strip()) - set(cfg))
@@ -771,6 +789,10 @@ def server(input, output, session):
         choices = {t: f"{t} ({counts.get(t, 0)})" for t in tests}
         first = max(tests, key=lambda t: counts.get(t, 0)) if tests else None
         ui.update_radio_buttons("cl_test", choices=choices, selected=first)
+        ui.update_action_button("cl_save", label="Mark incomplete" if _mode() == "undo" else "Save")
+        ui.update_action_button("cl_all", label="Select all")
+        if first:
+            ui.update_checkbox_group("cl_sel", selected=_default_sel(first, proj))
 
     @render.ui
     def cl_list():
@@ -778,7 +800,7 @@ def server(input, output, session):
         proj = input.cl_project() if "cl_project" in input else "(All)"
         choices = _pending_choices(test, proj)
         if not choices:
-            return ui.p(f"No {test} pending.", class_="text-muted")
+            return ui.p(f"No {test} {'completed' if _mode() == 'undo' else 'pending'}.", class_="text-muted")
         return ui.div(ui.input_checkbox_group("cl_sel", None, choices=choices),
                       style="max-height:50vh;overflow-y:auto;padding:6px 10px;")
 
@@ -807,35 +829,50 @@ def server(input, output, session):
         test = input.cl_test()
         proj = input.cl_project() if "cl_project" in input else "(All)"
         ui.update_action_button("cl_all", label="Select all")
-        ui.update_checkbox_group("cl_sel", selected=list(_pending_choices(test, proj).keys()))
+        ui.update_checkbox_group("cl_sel", selected=_default_sel(test, proj))
+
+    def _checked(df, test, proj):
+        """Rows for the checked samples (pending for this test/project) in the Complete Tests list."""
+        try:
+            sel = list(input.cl_sel() or [])
+        except Exception:
+            sel = []
+        return df.loc[_pending_mask(df, test, proj) & df["SampleID"].astype(str).isin(sel)]
 
     @render.ui
     def cl_buttons():
+        if _mode() == "undo":
+            return None
         test = input.cl_test()
         proj = input.cl_project() if "cl_project" in input else "(All)"
-        n = int(_pending_mask(samples.get(), test, proj).sum())
-        what = f"{n} pending {test} ({'all projects' if proj == '(All)' else proj})"
+        n = _checked(samples.get(), test, proj)["SampleID"].nunique()
+        what = f"{n} checked {test} ({'all projects' if proj == '(All)' else proj})"
         return ui.div(
             ui.download_button("cl_print", f"Print list: {what}", class_="btn-sm btn-outline-primary"),
             ui.download_button("cl_csv", f"CSV of sample IDs: {what}", class_="btn-sm btn-outline-primary"),
             class_="d-flex gap-2 flex-wrap")
 
-    @render.download(filename=lambda: f"{input.cl_project()}_{input.cl_test()}_pending.csv")
+    @render.download(filename=lambda: f"{input.cl_project()}_{input.cl_test()}_checked.csv")
     def cl_csv():
         test = input.cl_test()
         proj = input.cl_project() if "cl_project" in input else "(All)"
-        df = samples.get()
-        sub = df.loc[_pending_mask(df, test, proj)]
+        sub = _checked(samples.get(), test, proj)
+        if sub.empty:
+            ui.notification_show("Nothing checked.", duration=3)
+            return
         sub = sub.assign(_d=sub["SampleDate"].astype(str)).sort_values(["_d", "SampleID"])
         yield sub[PENDING_CSV_COLUMNS].drop_duplicates().to_csv(index=False).encode("utf-8-sig")
 
-    @render.download(filename=lambda: f"{input.cl_project()}_{input.cl_test()}_pending.pdf")
+    @render.download(filename=lambda: f"{input.cl_project()}_{input.cl_test()}_checked.pdf")
     def cl_print():
         test = input.cl_test()
         proj = input.cl_project() if "cl_project" in input else "(All)"
-        df = samples.get()
+        sub = _checked(samples.get(), test, proj)
+        if sub.empty:
+            ui.notification_show("Nothing checked.", duration=3)
+            return
         doc = pymupdf.open()
-        draw_test_list(doc, df.loc[_pending_mask(df, test, proj)], test)
+        draw_test_list(doc, sub, test)
         pdf_bytes = doc.tobytes()
         doc.close()
         yield pdf_bytes
@@ -851,6 +888,14 @@ def server(input, output, session):
             return
         df = samples.get().copy()
         m = df["SampleID"].astype(str).isin(sel) & _pending_mask(df, test, proj)
+        if _mode() == "undo":
+            for c in ("CompletedDate", "TestDate", "CompletedBy"):
+                df.loc[m, c] = None
+            samples.set(df)
+            update_samples(df.index[m.to_numpy()], CompletedDate=None, TestDate=None, CompletedBy=None)
+            ui.modal_remove()
+            ui.notification_show(f"{int(m.sum())} {test} marked incomplete.", duration=3)
+            return
         df.loc[m, "CompletedDate"] = input.cl_date()
         df.loc[m, "TestDate"] = input.cl_date()
         df.loc[m, "CompletedBy"] = input.cl_by()

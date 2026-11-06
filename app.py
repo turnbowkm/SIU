@@ -623,11 +623,9 @@ def server(input, output, session):
         if n == 0:
             return ui.tags.button("Print Labels: check sites first", type="button", disabled=True,
                                   class_="btn btn-success w-100")
-        first = int(input.start_suffix() or 1)
-        nums = f"#{first:03d}" if n == 1 else f"#{first:03d}-#{first + n - 1:03d}"
         return ui.download_button(
             "download_checked_labels",
-            f"Print {n} label{'s' if n != 1 else ''} ({len(sites)} site{'s' if len(sites) != 1 else ''} x {cnt}, {nums})",
+            f"Print {n} label{'s' if n != 1 else ''}",
             class_="btn-success w-100")
 
     @reactive.Effect

@@ -81,7 +81,7 @@ PRINT_USER_W = 70                         # pt, User column
 PRINT_TEST_COL_MAX = 60                   # pt, max width of each test column (shrinks to fit the page)
 PRINT_DONE_LABEL = "Complete"             # text shown in a test cell once that test is done
 
-# Help search (? button, top left): (title, what to do, search keywords, CSS selector to highlight, tab to open first)
+# Help search (? button, top left): (title, what to do, search keywords, CSS selector to highlight, tab to open first, button to click first)
 # Put the most common tasks first. Leave the selector empty for entries with nothing to highlight.
 HELP_ENTRIES = [
     ("Print labels for new samples", "Tick the sites, set Number of Samples, then click this button. Labels print without saving anything; samples are added to the database when their label is scanned.",
@@ -125,14 +125,34 @@ HELP_ENTRIES = [
 ] if HAVE_SHEETS else []) + [
     ("Mark tests complete", "Click Complete Tests, pick the project and test, tick the samples and save.",
      "complete finish done tested mark results finished analysis", "#cl_open", "Incomplete Tests"),
-    ("Undo a test marked complete by mistake", "Open Complete Tests and switch to Mark incomplete (undo).",
-     "undo mistake wrong accident incomplete reopen uncomplete unmark revert", "#cl_open", "Incomplete Tests"),
-    ("Print or export a checklist for one test", "Open Complete Tests, choose a project and test, then use the Print list or CSV buttons.",
-     "checklist list print export csv pending sample ids test bench", "#cl_open", "Incomplete Tests"),
-    ("Print the incomplete list", "Prints every sample that still has tests pending.",
-     "print incomplete list pending outstanding report pdf", "#download_incomplete", "Incomplete Tests"),
+    ("Mark tests complete by scanning", "Scan the sample's QR code, tick the tests that are finished in the window that opens, then Save.",
+     "scan complete finish done tested mark single one sample quick", "#scan", ""),
+    ("Choose the project to complete", "Pick one project, or (All) for every project's pending samples.",
+     "project complete choose pick filter all pending window", "#cl_project", "Incomplete Tests", "#cl_open"),
+    ("Choose the test to complete", "Pick the test you finished. The number in brackets is how many samples are still pending for it.",
+     "test choose pick analyte nutrients tss ecoli metals which test count pending number", "#cl_test", "Incomplete Tests", "#cl_open"),
+    ("Choose which samples were tested", "Tick the samples that were finished. They are all ticked by default.",
+     "tick check select samples list which finished choose untick", "#cl_list", "Incomplete Tests", "#cl_open"),
+    ("Tick or untick every sample in the list", "Toggles all samples in the list on or off.",
+     "select all deselect all tick untick every samples list toggle complete", "#cl_all", "Incomplete Tests", "#cl_open"),
+    ("Set the completed date", "Defaults to today. It is also saved as the Test Date.",
+     "completed date day when finished test date backdate yesterday", "#cl_date", "Incomplete Tests", "#cl_open"),
+    ("Set who completed the tests", "Pick the person who ran the tests.",
+     "completed by who person analyst name user tested", "#cl_by", "Incomplete Tests", "#cl_open"),
+    ("Save completed tests", "Saves the ticked samples as complete in the database.",
+     "save confirm submit finish done apply record", "#cl_save", "Incomplete Tests", "#cl_open"),
+    ("Undo a test marked complete by mistake", "Choose Mark incomplete (undo) here, tick the samples, then click Mark incomplete.",
+     "undo mistake wrong accident incomplete reopen uncomplete unmark revert fix", "#cl_mode", "Incomplete Tests", "#cl_open"),
+    ("Print a checklist for one test", "Prints the ticked samples for the chosen project and test, ready for the bench. Only shown in Mark complete mode.",
+     "checklist list print pending bench pdf worksheet test", "#cl_print", "Incomplete Tests", "#cl_open"),
+    ("Export sample IDs for one test", "Downloads a CSV of the ticked sample IDs for the chosen project and test. Only shown in Mark complete mode.",
+     "export csv sample ids list download excel pending test", "#cl_csv", "Incomplete Tests", "#cl_open"),
+    ("Print the incomplete list", "Prints a grid of every pending sample by test, with tests already done marked Complete.",
+     "print incomplete list pending outstanding report pdf grid", "#download_incomplete", "Incomplete Tests"),
     ("See what is still pending", "The bars show how many samples are waiting for each test, by project.",
-     "pending incomplete outstanding chart waiting backlog overdue oldest bars", "#incomplete_chart", "Incomplete Tests"),
+     "pending incomplete outstanding chart waiting backlog bars", "#incomplete_chart", "Incomplete Tests"),
+    ("Find the oldest pending samples", "The right-hand column shows the oldest and newest sample date for each test, and how many days the oldest has been waiting.",
+     "oldest age days waiting overdue how long old holding time hold expire late", "#incomplete_chart", "Incomplete Tests"),
     ("Open the data in Excel", f"The app keeps {EXPORT_FILE} in its folder up to date automatically. Open that file in Excel.",
      "excel csv export data spreadsheet download database open file", "", ""),
 ]
@@ -559,7 +579,13 @@ def get_next_suffix(df, project):
     return int(nums.max()) + 1 if nums.notna().any() else 1
 
 
-HELP_JSON = json.dumps([dict(zip(("title", "description", "keywords", "selector", "tab"), e)) for e in HELP_ENTRIES])
+def _help_button(**attrs):
+    return ui.tags.button("?", type="button", title="Help: find what you want to do",
+                          class_="btn btn-sm btn-outline-secondary rounded-circle ms-2 help-open",
+                          style="width:28px;height:28px;padding:0;line-height:1;font-weight:700;", **attrs)
+
+
+HELP_JSON = json.dumps([dict(zip(("title", "description", "keywords", "selector", "tab", "open"), e)) for e in HELP_ENTRIES])
 
 HELP_CSS = """
 #help_panel { display:none; position:fixed; top:56px; left:16px; width:380px; max-width:calc(100vw - 32px);
@@ -613,7 +639,40 @@ HELP_JS = r"""
     var c = el('help_callout'); if (c) c.remove();
     clearTimeout(hideTimer);
   }
-  function closePanel() { el('help_panel').style.display = 'none'; }
+  function closePanel() { var p = el('help_panel'); if (p) p.style.display = 'none'; }
+  // find the target; if it lives in a window that is not open yet, click the opener and wait for it
+  function locate(e, done) {
+    var t = e.selector ? document.querySelector(e.selector) : null;
+    if (t || !e.open || !e.selector) return done(t);
+    var ob = document.querySelector(e.open);
+    if (ob) ob.click();
+    var tries = 0, iv = setInterval(function () {
+      var f = document.querySelector(e.selector);
+      if (f || ++tries > 30) { clearInterval(iv); done(f); }
+    }, 100);
+  }
+  function present(e, target) {
+    if (target) target = target.closest('.shiny-input-container') || target;
+    var c = document.createElement('div');
+    c.id = 'help_callout';
+    var b = document.createElement('b'); b.textContent = e.title;
+    var p = document.createElement('div');
+    p.textContent = target || !e.selector ? e.description : e.description + ' (It is not on screen right now.)';
+    c.appendChild(b); c.appendChild(p);
+    document.body.appendChild(c);
+    var top = 70, left = Math.max(8, (window.innerWidth - c.offsetWidth) / 2);
+    if (target) {
+      target.scrollIntoView({block: 'center', behavior: 'auto'});
+      target.classList.add('help-highlight');
+      var r = target.getBoundingClientRect();
+      top = r.bottom + 14;
+      if (top + c.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - c.offsetHeight - 14);
+      left = Math.min(Math.max(8, r.left), window.innerWidth - c.offsetWidth - 8);
+    }
+    c.style.top = top + 'px'; c.style.left = left + 'px';
+    setTimeout(function () { document.addEventListener('mousedown', clearHelp, {once: true, capture: true}); }, 200);
+    hideTimer = setTimeout(clearHelp, 15000);
+  }
   function showEntry(e) {
     clearHelp(); closePanel();
     var delay = 0;
@@ -621,29 +680,7 @@ HELP_JS = r"""
       var a = document.querySelector('a[data-value="' + e.tab + '"]');
       if (a && !a.classList.contains('active')) { a.click(); delay = 350; }
     }
-    setTimeout(function () {
-      var target = e.selector ? document.querySelector(e.selector) : null;
-      if (target) target = target.closest('.shiny-input-container') || target;
-      var c = document.createElement('div');
-      c.id = 'help_callout';
-      var b = document.createElement('b'); b.textContent = e.title;
-      var p = document.createElement('div');
-      p.textContent = target || !e.selector ? e.description : e.description + ' (It is not on screen right now.)';
-      c.appendChild(b); c.appendChild(p);
-      document.body.appendChild(c);
-      var top = 70, left = Math.max(8, (window.innerWidth - c.offsetWidth) / 2);
-      if (target) {
-        target.scrollIntoView({block: 'center', behavior: 'auto'});
-        target.classList.add('help-highlight');
-        var r = target.getBoundingClientRect();
-        top = r.bottom + 14;
-        if (top + c.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - c.offsetHeight - 14);
-        left = Math.min(Math.max(8, r.left), window.innerWidth - c.offsetWidth - 8);
-      }
-      c.style.top = top + 'px'; c.style.left = left + 'px';
-      setTimeout(function () { document.addEventListener('mousedown', clearHelp, {once: true, capture: true}); }, 200);
-      hideTimer = setTimeout(clearHelp, 15000);
-    }, delay);
+    setTimeout(function () { locate(e, function (t) { present(e, t); }); }, delay);
   }
   function render() {
     var q = el('help_q').value, box = el('help_results');
@@ -665,28 +702,39 @@ HELP_JS = r"""
     });
   }
   function mark() {
-    var items = el('help_results').querySelectorAll('.help-item');
-    items.forEach(function (n, i) { n.classList.toggle('help-top', i === sel); });
+    el('help_results').querySelectorAll('.help-item').forEach(function (n, i) { n.classList.toggle('help-top', i === sel); });
+  }
+  // inside an open window the panel must live in that window, or its focus trap steals focus from the search box
+  function togglePanel() {
+    var panel = el('help_panel'), q = el('help_q');
+    if (panel.style.display === 'block') { panel.style.display = 'none'; return; }
+    var host = document.querySelector('.modal.show') || document.body;
+    if (panel.parentNode !== host) host.appendChild(panel);
+    clearHelp(); panel.style.display = 'block'; q.value = ''; render(); q.focus();
   }
   function init() {
-    var btn = el('help_btn'), panel = el('help_panel'), q = el('help_q');
-    if (!btn || !panel || !q) return;
-    btn.addEventListener('click', function () {
-      var open = panel.style.display === 'block';
-      panel.style.display = open ? 'none' : 'block';
-      if (!open) { clearHelp(); q.value = ''; render(); q.focus(); }
+    var panel = el('help_panel'), q = el('help_q');
+    if (!panel || !q) return;
+    document.addEventListener('click', function (ev) {
+      var b = ev.target.closest && ev.target.closest('.help-open');
+      if (b) { ev.preventDefault(); togglePanel(); }
     });
     q.addEventListener('input', render);
     q.addEventListener('keydown', function (ev) {
       if (ev.key === 'Enter') { ev.preventDefault(); if (results[sel]) showEntry(results[sel]); }
       else if (ev.key === 'ArrowDown') { ev.preventDefault(); sel = Math.min(sel + 1, results.length - 1); mark(); }
       else if (ev.key === 'ArrowUp') { ev.preventDefault(); sel = Math.max(sel - 1, 0); mark(); }
+      else if (ev.key === 'Escape') { ev.stopPropagation(); closePanel(); }
     });
     document.addEventListener('keydown', function (ev) {
       if (ev.key === 'Escape') { closePanel(); clearHelp(); }
     });
     document.addEventListener('mousedown', function (ev) {
-      if (panel.style.display === 'block' && !panel.contains(ev.target) && !btn.contains(ev.target)) closePanel();
+      if (panel.style.display === 'block' && !panel.contains(ev.target) && !(ev.target.closest && ev.target.closest('.help-open'))) closePanel();
+    });
+    document.addEventListener('hide.bs.modal', function () {   // keep the panel alive when its window closes
+      panel.style.display = 'none';
+      if (panel.parentNode !== document.body) document.body.appendChild(panel);
     });
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
@@ -791,10 +839,7 @@ $(document).on('shiny:connected', focusScan);
         ),
         id="main_tabs",
     ),
-    title=ui.span("Sample Tracker",
-                  ui.tags.button("?", id="help_btn", type="button", title="Help: find what you want to do",
-                                 class_="btn btn-sm btn-outline-secondary rounded-circle ms-2",
-                                 style="width:28px;height:28px;padding:0;line-height:1;font-weight:700;")),
+    title=ui.span("Sample Tracker", _help_button(id="help_btn")),
 )
 
 
@@ -986,7 +1031,7 @@ def server(input, output, session):
                 ui.input_date("cl_date", "Completed date:", value=date.today()),
                 ui.input_select("cl_by", "Completed by:", choices=users, selected=input.user()),
             ),
-            title="Complete tests",
+            title=ui.span("Complete tests", _help_button()),
             footer=ui.TagList(ui.modal_button("Cancel"),
                               ui.input_action_button("cl_save", "Save", class_="btn-primary")),
             size="l", easy_close=True,

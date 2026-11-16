@@ -4,6 +4,7 @@ from datetime import date
 import pymupdf
 import tempfile
 import os
+import json
 import math
 import sqlite3
 import threading
@@ -79,6 +80,62 @@ PRINT_DATE_W = 72                         # pt, Sample Date column
 PRINT_USER_W = 70                         # pt, User column
 PRINT_TEST_COL_MAX = 60                   # pt, max width of each test column (shrinks to fit the page)
 PRINT_DONE_LABEL = "Complete"             # text shown in a test cell once that test is done
+
+# Help search (? button, top left): (title, what to do, search keywords, CSS selector to highlight, tab to open first)
+# Put the most common tasks first. Leave the selector empty for entries with nothing to highlight.
+HELP_ENTRIES = [
+    ("Print labels for new samples", "Tick the sites, set Number of Samples, then click this button. Labels print without saving anything; samples are added to the database when their label is scanned.",
+     "print new samples labels label qr code barcode sticker generate make", "#print_button > a, #print_button > button", ""),
+    ("Add samples to the database", "Adds samples for the checked sites right now, without scanning.",
+     "add new samples create save record register enter database", "#add_samples", ""),
+    ("Choose which sites", "Tick the sites you are sampling. All of the project's sites are ticked by default.",
+     "sites site select choose checkbox location station tick untick", "#site_selector", ""),
+    ("Select or deselect all sites", "Toggles every site in the project on or off.",
+     "select all deselect all sites check uncheck toggle none every", "#sites_all", ""),
+    ("Choose the project", "Changing the project changes the list of sites and the numbering.",
+     "project change switch pick select program", "#project", ""),
+    ("Choose your name", "Pick who is doing the sampling. New samples are recorded under this user.",
+     "user name who me person collector operator sampler", "#user", ""),
+    ("Set the sample date", "Date written on the labels and on new samples.",
+     "date day when collected collection sample date", "#sample_date", ""),
+    ("Set how many labels per site", "Number of Samples is how many samples (and labels) each checked site gets.",
+     "number how many count samples per site quantity duplicates extra more fewer", "#count", ""),
+    ("Change the starting sample number", "The next free number for the project is filled in for you. Change it only if you need a different start.",
+     "starting suffix number sample id sequence counter next change start", "#start_suffix", ""),
+    ("Scan a sample", "Click here and scan a sample's QR code to open it."
+     + (" A label for a sample that isn't in the database yet is added when scanned." if SCAN_ADDS_SAMPLES else ""),
+     "scan sample qr code barcode open look up find reader", "#scan", ""),
+    ("Log chemicals used", "Scan a sample first, then scan each chemical barcode in the window that opens. Expired chemicals are flagged.",
+     "chemical chemicals supplies reagent lot expiration expired log scan used standards", "#scan", ""),
+    ("Release the active sample", f"Scan the code {RELEASE_CODE} when you are finished with the current sample.",
+     "release active sample finish done clear unlock stop current", "#scan", ""),
+    ("See the active sample", "Shows which sample chemical scans are being logged to.",
+     "active sample current which showing status", "#active_label", ""),
+    ("Choose which records are shown", "Switch between incomplete, recent and all rows.",
+     "show filter view records table incomplete recent all rows hide older", "#view_mode", "Records"),
+    ("Find or edit a record", "Use the filter boxes under the column names to search; double-click a cell to edit it.",
+     "find search filter edit change fix correct record row cell comment table", "#sample_table", "Records"),
+    ("Preview a label", "Click a row in the table to see its label here.",
+     "preview look label see row", "#label_preview", "Records"),
+    ("Reprint labels for existing samples", "Click rows in the table, then click Download Selected Labels.",
+     "reprint print again duplicate lost damaged selected existing label", "#download_label", "Records"),
+] + ([
+    ("Print sample sheets", "Click rows in the table, then click this to print a field sheet for each sample.",
+     "sample sheet field sheet data sheet paper print", "#download_sheets", "Records"),
+] if HAVE_SHEETS else []) + [
+    ("Mark tests complete", "Click Complete Tests, pick the project and test, tick the samples and save.",
+     "complete finish done tested mark results finished analysis", "#cl_open", "Incomplete Tests"),
+    ("Undo a test marked complete by mistake", "Open Complete Tests and switch to Mark incomplete (undo).",
+     "undo mistake wrong accident incomplete reopen uncomplete unmark revert", "#cl_open", "Incomplete Tests"),
+    ("Print or export a checklist for one test", "Open Complete Tests, choose a project and test, then use the Print list or CSV buttons.",
+     "checklist list print export csv pending sample ids test bench", "#cl_open", "Incomplete Tests"),
+    ("Print the incomplete list", "Prints every sample that still has tests pending.",
+     "print incomplete list pending outstanding report pdf", "#download_incomplete", "Incomplete Tests"),
+    ("See what is still pending", "The bars show how many samples are waiting for each test, by project.",
+     "pending incomplete outstanding chart waiting backlog overdue oldest bars", "#incomplete_chart", "Incomplete Tests"),
+    ("Open the data in Excel", f"The app keeps {EXPORT_FILE} in its folder up to date automatically. Open that file in Excel.",
+     "excel csv export data spreadsheet download database open file", "", ""),
+]
 # ----------------------------------------
 
 config_df = pd.read_csv(CONFIG_FILE)
@@ -502,6 +559,140 @@ def get_next_suffix(df, project):
     return int(nums.max()) + 1 if nums.notna().any() else 1
 
 
+HELP_JSON = json.dumps([dict(zip(("title", "description", "keywords", "selector", "tab"), e)) for e in HELP_ENTRIES])
+
+HELP_CSS = """
+#help_panel { display:none; position:fixed; top:56px; left:16px; width:380px; max-width:calc(100vw - 32px);
+  max-height:70vh; overflow-y:auto; z-index:2000; padding:12px; border-radius:8px;
+  background:var(--bs-body-bg,#fff); color:var(--bs-body-color,#212529);
+  border:1px solid var(--bs-border-color,#ccc); box-shadow:0 8px 24px rgba(0,0,0,.25); }
+#help_panel .help-item { display:block; width:100%; text-align:left; padding:8px 10px; margin-top:6px; cursor:pointer;
+  border:1px solid var(--bs-border-color,#ddd); border-radius:6px; background:transparent; color:inherit; }
+#help_panel .help-item:hover, #help_panel .help-item.help-top { border-color:#ff9800; background:rgba(255,152,0,.10); }
+#help_panel .help-item b { display:block; }
+#help_panel .help-item span { font-size:.85em; opacity:.75; }
+#help_panel .help-hint { font-size:.8em; opacity:.65; margin-top:8px; }
+.help-highlight { outline:4px solid #ff9800 !important; outline-offset:3px; border-radius:6px;
+  animation:helpPulse 1.1s ease-in-out infinite; }
+@keyframes helpPulse { 0%,100% { box-shadow:0 0 0 0 rgba(255,152,0,.75); } 50% { box-shadow:0 0 0 12px rgba(255,152,0,0); } }
+#help_callout { position:fixed; z-index:2500; max-width:320px; padding:10px 12px; border-radius:8px;
+  background:#ff9800; color:#1b1b1b; box-shadow:0 6px 18px rgba(0,0,0,.3); font-size:.9em; }
+#help_callout b { display:block; margin-bottom:2px; }
+"""
+
+HELP_JS = r"""
+(function () {
+  var ENTRIES = __ENTRIES__;
+  var STOP = {the:1,a:1,an:1,to:1,how:1,do:1,i:1,my:1,for:1,of:1,and:1,can:1,want:1,where:1,is:1,in:1,on:1,it:1,me:1,need:1};
+  var results = [], sel = 0, hideTimer = null;
+  function norm(s) { return (s || '').toLowerCase(); }
+  function toks(q) {
+    return norm(q).split(/[^a-z0-9]+/).filter(function (w) { return w && !STOP[w]; })
+      .map(function (w) { return w.length > 3 && w.slice(-1) === 's' ? w.slice(0, -1) : w; });
+  }
+  function score(e, ts) {
+    var t = norm(e.title), k = norm(e.keywords), d = norm(e.description), s = 0;
+    ts.forEach(function (w) {
+      if (t.indexOf(w) > -1) s += 3;
+      if (k.indexOf(w) > -1) s += 2;
+      if (d.indexOf(w) > -1) s += 1;
+    });
+    return s;
+  }
+  function search(q) {
+    var ts = toks(q);
+    if (!ts.length) return ENTRIES.slice(0, 6);
+    return ENTRIES.map(function (e, i) { return {e: e, s: score(e, ts), i: i}; })
+      .filter(function (x) { return x.s > 0; })
+      .sort(function (a, b) { return b.s - a.s || a.i - b.i; })
+      .slice(0, 5).map(function (x) { return x.e; });
+  }
+  function el(id) { return document.getElementById(id); }
+  function clearHelp() {
+    document.querySelectorAll('.help-highlight').forEach(function (n) { n.classList.remove('help-highlight'); });
+    var c = el('help_callout'); if (c) c.remove();
+    clearTimeout(hideTimer);
+  }
+  function closePanel() { el('help_panel').style.display = 'none'; }
+  function showEntry(e) {
+    clearHelp(); closePanel();
+    var delay = 0;
+    if (e.tab) {
+      var a = document.querySelector('a[data-value="' + e.tab + '"]');
+      if (a && !a.classList.contains('active')) { a.click(); delay = 350; }
+    }
+    setTimeout(function () {
+      var target = e.selector ? document.querySelector(e.selector) : null;
+      if (target) target = target.closest('.shiny-input-container') || target;
+      var c = document.createElement('div');
+      c.id = 'help_callout';
+      var b = document.createElement('b'); b.textContent = e.title;
+      var p = document.createElement('div');
+      p.textContent = target || !e.selector ? e.description : e.description + ' (It is not on screen right now.)';
+      c.appendChild(b); c.appendChild(p);
+      document.body.appendChild(c);
+      var top = 70, left = Math.max(8, (window.innerWidth - c.offsetWidth) / 2);
+      if (target) {
+        target.scrollIntoView({block: 'center', behavior: 'auto'});
+        target.classList.add('help-highlight');
+        var r = target.getBoundingClientRect();
+        top = r.bottom + 14;
+        if (top + c.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - c.offsetHeight - 14);
+        left = Math.min(Math.max(8, r.left), window.innerWidth - c.offsetWidth - 8);
+      }
+      c.style.top = top + 'px'; c.style.left = left + 'px';
+      setTimeout(function () { document.addEventListener('mousedown', clearHelp, {once: true, capture: true}); }, 200);
+      hideTimer = setTimeout(clearHelp, 15000);
+    }, delay);
+  }
+  function render() {
+    var q = el('help_q').value, box = el('help_results');
+    results = search(q); sel = 0;
+    box.innerHTML = '';
+    if (!results.length) {
+      var n = document.createElement('div'); n.className = 'help-hint';
+      n.textContent = 'Nothing matches. Try other words, like "print", "scan", "undo" or "excel".';
+      box.appendChild(n); return;
+    }
+    results.forEach(function (e, i) {
+      var b = document.createElement('button');
+      b.type = 'button'; b.className = 'help-item' + (i === 0 ? ' help-top' : '');
+      var t = document.createElement('b'); t.textContent = e.title;
+      var d = document.createElement('span'); d.textContent = e.description;
+      b.appendChild(t); b.appendChild(d);
+      b.addEventListener('click', function () { showEntry(e); });
+      box.appendChild(b);
+    });
+  }
+  function mark() {
+    var items = el('help_results').querySelectorAll('.help-item');
+    items.forEach(function (n, i) { n.classList.toggle('help-top', i === sel); });
+  }
+  function init() {
+    var btn = el('help_btn'), panel = el('help_panel'), q = el('help_q');
+    if (!btn || !panel || !q) return;
+    btn.addEventListener('click', function () {
+      var open = panel.style.display === 'block';
+      panel.style.display = open ? 'none' : 'block';
+      if (!open) { clearHelp(); q.value = ''; render(); q.focus(); }
+    });
+    q.addEventListener('input', render);
+    q.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); if (results[sel]) showEntry(results[sel]); }
+      else if (ev.key === 'ArrowDown') { ev.preventDefault(); sel = Math.min(sel + 1, results.length - 1); mark(); }
+      else if (ev.key === 'ArrowUp') { ev.preventDefault(); sel = Math.max(sel - 1, 0); mark(); }
+    });
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') { closePanel(); clearHelp(); }
+    });
+    document.addEventListener('mousedown', function (ev) {
+      if (panel.style.display === 'block' && !panel.contains(ev.target) && !btn.contains(ev.target)) closePanel();
+    });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+"""
+
 SCAN_KEYS = "['Enter','Tab']" if SCAN_ACCEPT_TAB else "['Enter']"
 
 app_ui = ui.page_sidebar(
@@ -542,6 +733,15 @@ document.addEventListener('hidden.bs.modal', function() {
 });
 $(document).on('shiny:connected', focusScan);
 """),
+    ui.tags.style(HELP_CSS),
+    ui.tags.script(HELP_JS.replace("__ENTRIES__", HELP_JSON)),
+    ui.div(
+        ui.tags.input(id="help_q", type="text", class_="form-control", autocomplete="off",
+                      placeholder="What do you want to do? e.g. print new samples"),
+        ui.div(id="help_results"),
+        ui.div("Press Enter to show me where.", class_="help-hint"),
+        id="help_panel",
+    ),
     ui.navset_tab(
         ui.nav_panel(
             "Records",
@@ -591,6 +791,10 @@ $(document).on('shiny:connected', focusScan);
         ),
         id="main_tabs",
     ),
+    title=ui.span("Sample Tracker",
+                  ui.tags.button("?", id="help_btn", type="button", title="Help: find what you want to do",
+                                 class_="btn btn-sm btn-outline-secondary rounded-circle ms-2",
+                                 style="width:28px;height:28px;padding:0;line-height:1;font-weight:700;")),
 )
 
 

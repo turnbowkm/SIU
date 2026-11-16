@@ -598,6 +598,7 @@ HELP_CSS = """
 #help_panel .help-item b { display:block; }
 #help_panel .help-item span { font-size:.85em; opacity:.75; }
 #help_panel .help-hint { font-size:.8em; opacity:.65; margin-top:8px; }
+#help_panel .help-group { font-size:.75em; font-weight:700; text-transform:uppercase; letter-spacing:.04em; opacity:.6; margin-top:12px; }
 .help-highlight { outline:4px solid #ff9800 !important; outline-offset:3px; border-radius:6px;
   animation:helpPulse 1.1s ease-in-out infinite; }
 @keyframes helpPulse { 0%,100% { box-shadow:0 0 0 0 rgba(255,152,0,.75); } 50% { box-shadow:0 0 0 12px rgba(255,152,0,0); } }
@@ -610,7 +611,7 @@ HELP_JS = r"""
 (function () {
   var ENTRIES = __ENTRIES__;
   var STOP = {the:1,a:1,an:1,to:1,how:1,do:1,i:1,my:1,for:1,of:1,and:1,can:1,want:1,where:1,is:1,in:1,on:1,it:1,me:1,need:1};
-  var results = [], sel = 0, hideTimer = null;
+  var results = [], sel = 0, hideTimer = null, P = null, Q = null;
   function norm(s) { return (s || '').toLowerCase(); }
   function toks(q) {
     return norm(q).split(/[^a-z0-9]+/).filter(function (w) { return w && !STOP[w]; })
@@ -625,10 +626,30 @@ HELP_JS = r"""
     });
     return s;
   }
-  function search(q) {
+  function activeTab() {
+    var a = document.querySelector('#main_tabs a.nav-link.active');
+    return a ? a.getAttribute('data-value') : '';
+  }
+  function ctx() {
+    if (document.querySelector('.modal.show #cl_project')) return {kind: 'modal', label: 'the Complete Tests window'};
+    var t = activeTab();
+    return {kind: 'tab', tab: t, label: t ? 'the ' + t + ' tab' : 'this page'};
+  }
+  function boost(e, c) { return c.kind === 'modal' ? (e.open ? 1 : 0) : (e.tab === c.tab ? 1 : 0); }
+  // what to show before anything is typed: the topics for wherever the user is right now
+  function groups(c) {
+    if (c.kind === 'modal') return [['In the Complete Tests window', ENTRIES.filter(function (e) { return e.open; })]];
+    var A = ENTRIES.filter(function (e) { return e.tab === c.tab && !e.open; }),
+        B = ENTRIES.filter(function (e) { return e.tab === c.tab && e.open; }),
+        C = ENTRIES.filter(function (e) { return !e.tab && !e.open; }), g = [];
+    if (A.length) g.push(['On this tab', A]);
+    if (B.length) g.push(['In the pop-up window', B]);
+    if (A.length + B.length < 8) g.push(['Sidebar and scanning', C.slice(0, 6)]);
+    return g;
+  }
+  function search(q, c) {
     var ts = toks(q);
-    if (!ts.length) return ENTRIES.slice(0, 6);
-    return ENTRIES.map(function (e, i) { return {e: e, s: score(e, ts), i: i}; })
+    return ENTRIES.map(function (e, i) { var s = score(e, ts); return {e: e, s: s ? s + boost(e, c) : 0, i: i}; })
       .filter(function (x) { return x.s > 0; })
       .sort(function (a, b) { return b.s - a.s || a.i - b.i; })
       .slice(0, 5).map(function (x) { return x.e; });
@@ -639,7 +660,7 @@ HELP_JS = r"""
     var c = el('help_callout'); if (c) c.remove();
     clearTimeout(hideTimer);
   }
-  function closePanel() { var p = el('help_panel'); if (p) p.style.display = 'none'; }
+  function closePanel() { if (P) P.style.display = 'none'; }
   // find the target; if it lives in a window that is not open yet, click the opener and wait for it
   function locate(e, done) {
     var t = e.selector ? document.querySelector(e.selector) : null;
@@ -682,38 +703,48 @@ HELP_JS = r"""
     }
     setTimeout(function () { locate(e, function (t) { present(e, t); }); }, delay);
   }
+  function addItem(box, e, i) {
+    var b = document.createElement('button');
+    b.type = 'button'; b.className = 'help-item' + (i === 0 ? ' help-top' : '');
+    var t = document.createElement('b'); t.textContent = e.title;
+    var d = document.createElement('span'); d.textContent = e.description;
+    b.appendChild(t); b.appendChild(d);
+    b.addEventListener('click', function () { showEntry(e); });
+    box.appendChild(b);
+  }
   function render() {
-    var q = el('help_q').value, box = el('help_results');
-    results = search(q); sel = 0;
-    box.innerHTML = '';
+    var q = el('help_q').value, box = el('help_results'), c = ctx();
+    el('help_context').textContent = 'Help for ' + c.label + '. Type to search everything else.';
+    box.innerHTML = ''; results = []; sel = 0;
+    if (!toks(q).length) {
+      groups(c).forEach(function (g) {
+        var h = document.createElement('div'); h.className = 'help-group'; h.textContent = g[0];
+        box.appendChild(h);
+        g[1].forEach(function (e) { addItem(box, e, results.length); results.push(e); });
+      });
+      return;
+    }
+    results = search(q, c);
     if (!results.length) {
       var n = document.createElement('div'); n.className = 'help-hint';
       n.textContent = 'Nothing matches. Try other words, like "print", "scan", "undo" or "excel".';
       box.appendChild(n); return;
     }
-    results.forEach(function (e, i) {
-      var b = document.createElement('button');
-      b.type = 'button'; b.className = 'help-item' + (i === 0 ? ' help-top' : '');
-      var t = document.createElement('b'); t.textContent = e.title;
-      var d = document.createElement('span'); d.textContent = e.description;
-      b.appendChild(t); b.appendChild(d);
-      b.addEventListener('click', function () { showEntry(e); });
-      box.appendChild(b);
-    });
+    results.forEach(function (e, i) { addItem(box, e, i); });
   }
   function mark() {
     el('help_results').querySelectorAll('.help-item').forEach(function (n, i) { n.classList.toggle('help-top', i === sel); });
   }
   // inside an open window the panel must live in that window, or its focus trap steals focus from the search box
   function togglePanel() {
-    var panel = el('help_panel'), q = el('help_q');
-    if (panel.style.display === 'block') { panel.style.display = 'none'; return; }
+    if (!P.isConnected) document.body.appendChild(P);        // its window was removed without a hide event
+    if (P.style.display === 'block') { P.style.display = 'none'; return; }
     var host = document.querySelector('.modal.show') || document.body;
-    if (panel.parentNode !== host) host.appendChild(panel);
-    clearHelp(); panel.style.display = 'block'; q.value = ''; render(); q.focus();
+    if (P.parentNode !== host) host.appendChild(P);
+    clearHelp(); P.style.display = 'block'; Q.value = ''; render(); Q.focus();
   }
   function init() {
-    var panel = el('help_panel'), q = el('help_q');
+    var panel = P = el('help_panel'), q = Q = el('help_q');
     if (!panel || !q) return;
     document.addEventListener('click', function (ev) {
       var b = ev.target.closest && ev.target.closest('.help-open');
@@ -786,6 +817,7 @@ $(document).on('shiny:connected', focusScan);
     ui.div(
         ui.tags.input(id="help_q", type="text", class_="form-control", autocomplete="off",
                       placeholder="What do you want to do? e.g. print new samples"),
+        ui.div(id="help_context", class_="help-hint"),
         ui.div(id="help_results"),
         ui.div("Press Enter to show me where.", class_="help-hint"),
         id="help_panel",
